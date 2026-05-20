@@ -1,0 +1,36 @@
+{
+  "name": "@thequirkyfox/sokoban-utils",
+  "version": "0.1.0",
+  "description": "Sokoban bitplane codec, solver, and URL encoder — compiled from Rust to WASM",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "pkg/"
+  ],
+  "scripts": {
+    "build:wasm": "cd crate && wasm-pack build --target web --out-dir ../pkg --release",
+    "build:ts": "tsc --build",
+    "build": "npm run build:wasm && npm run build:ts",
+    "dev": "npm run build:wasm && tsc --build --watch",
+    "test:rs": "cd crate && cargo test",
+    "test:ts": "node --experimental-vm-modules node_modules/.bin/jest",
+    "test": "npm run test:rs && npm run test:ts",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "jest": "^29.0.0",
+    "@types/jest": "^29.0.0"
+  },
+  "keywords": ["sokoban", "wasm", "webassembly", "puzzle", "bitplane", "solver"],
+  "license": "MIT"
+}

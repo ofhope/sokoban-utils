@@ -3,3 +3,8 @@ dist/
 pkg/
 crate/target/
 *.wasm
+
+solve-bench/target/
+
+.DS_Store
+*.DS_Store

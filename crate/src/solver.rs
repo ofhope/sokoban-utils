@@ -128,7 +128,7 @@ impl Solver {
                 new_boxes.set(push.to_x, push.to_y);
 
                 // Prune: freeze deadlock (biaxial chain detection)
-                if is_freeze_deadlock(push.to_x, push.to_y, &new_boxes, &self.walls, &self.goals) {
+                if is_freeze_deadlock(push.to_x, push.to_y, &new_boxes, &self.walls, &self.goals, &self.dead) {
                     continue;
                 }
 
@@ -605,6 +605,7 @@ fn is_freeze_deadlock(
     boxes: &BitPlane,
     walls: &BitPlane,
     goals: &BitPlane,
+    dead: &BitPlane,
 ) -> bool {
     let w = walls.width;
     let h = walls.height;
@@ -614,8 +615,8 @@ fn is_freeze_deadlock(
     let mut ch = vec![0u8; cells]; // horizontal axis cache
     let mut cv = vec![0u8; cells]; // vertical axis cache
 
-    if !blocked_axis(to_x, to_y, true,  boxes, walls, w, h, &mut ch) { return false; }
-    if !blocked_axis(to_x, to_y, false, boxes, walls, w, h, &mut cv) { return false; }
+    if !blocked_axis(to_x, to_y, true,  boxes, walls, dead, w, h, &mut ch) { return false; }
+    if !blocked_axis(to_x, to_y, false, boxes, walls, dead, w, h, &mut cv) { return false; }
 
     // There must be at least one non-goal box in the frozen group, otherwise
     // all frozen boxes are already on their goals and that is fine.
@@ -636,6 +637,14 @@ fn is_freeze_deadlock(
 /// `horizontal = true`  → checks the left/right axis.
 /// `horizontal = false` → checks the up/down axis.
 ///
+/// A box is blocked along an axis when any of the following hold:
+///   - A wall (or OOB) exists on either side along that axis.
+///   - Both neighbours along that axis are dead squares (YASS `FLAG_ILLEGAL_BOX_SQUARE`):
+///     pushing left would land on a dead square; same for right — so there is no
+///     useful push in either direction.
+///   - A neighbouring box exists that is itself blocked along the same axis
+///     (biaxial chain recursion).
+///
 /// The in-progress marker (1) breaks cycles: if A depends on B and B on A,
 /// both are treated as frozen, which is correct — they mutually block each other.
 fn blocked_axis(
@@ -643,6 +652,7 @@ fn blocked_axis(
     horizontal: bool,
     boxes: &BitPlane,
     walls: &BitPlane,
+    dead: &BitPlane,
     width: u8, height: u8,
     cache: &mut [u8],
 ) -> bool {
@@ -656,24 +666,41 @@ fn blocked_axis(
     cache[idx] = 1; // mark in-progress
 
     let result = if horizontal {
-        // Blocked on the left side?
-        let left = x == 0 || walls.get(x - 1, y)
-            || (boxes.get(x - 1, y)
-                && blocked_axis(x - 1, y, true, boxes, walls, width, height, cache));
-        // Blocked on the right side?
-        let right = x + 1 >= width || walls.get(x + 1, y)
-            || (boxes.get(x + 1, y)
-                && blocked_axis(x + 1, y, true, boxes, walls, width, height, cache));
-        // Either side blocked → the box cannot be pushed in either horizontal direction.
-        left || right
+        let left_wall  = x == 0         || walls.get(x - 1, y);
+        let right_wall = x + 1 >= width || walls.get(x + 1, y);
+
+        // YASS FLAG_ILLEGAL_BOX_SQUARE: if both neighbours are dead squares, there
+        // is no useful push in either direction along this axis.
+        // Guard: `!left_wall && !right_wall` also guarantees x >= 1 and x+1 < width,
+        // so the dead.get() calls are safe.
+        let both_dead = !left_wall && !right_wall
+            && dead.get(x - 1, y) && dead.get(x + 1, y);
+
+        // Only check for a frozen adjacent box when there is no wall on that side
+        // (a wall already blocks that direction; no need to recurse).
+        let left_frozen = !left_wall
+            && boxes.get(x - 1, y)
+            && blocked_axis(x - 1, y, true, boxes, walls, dead, width, height, cache);
+        let right_frozen = !right_wall
+            && boxes.get(x + 1, y)
+            && blocked_axis(x + 1, y, true, boxes, walls, dead, width, height, cache);
+
+        left_wall || right_wall || both_dead || left_frozen || right_frozen
     } else {
-        let up = y == 0 || walls.get(x, y - 1)
-            || (boxes.get(x, y - 1)
-                && blocked_axis(x, y - 1, false, boxes, walls, width, height, cache));
-        let down = y + 1 >= height || walls.get(x, y + 1)
-            || (boxes.get(x, y + 1)
-                && blocked_axis(x, y + 1, false, boxes, walls, width, height, cache));
-        up || down
+        let up_wall   = y == 0          || walls.get(x, y - 1);
+        let down_wall = y + 1 >= height || walls.get(x, y + 1);
+
+        let both_dead = !up_wall && !down_wall
+            && dead.get(x, y - 1) && dead.get(x, y + 1);
+
+        let up_frozen = !up_wall
+            && boxes.get(x, y - 1)
+            && blocked_axis(x, y - 1, false, boxes, walls, dead, width, height, cache);
+        let down_frozen = !down_wall
+            && boxes.get(x, y + 1)
+            && blocked_axis(x, y + 1, false, boxes, walls, dead, width, height, cache);
+
+        up_wall || down_wall || both_dead || up_frozen || down_frozen
     };
 
     cache[idx] = if result { 3 } else { 2 };

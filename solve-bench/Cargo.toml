@@ -1,0 +1,24 @@
+[package]
+name = "solve-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Parallel Sokoban solver harness — links the sokoban-utils crate directly and runs all puzzles in normalised-levels.xsb through Rayon."
+
+[[bin]]
+name = "solve-bench"
+path = "src/main.rs"
+
+[dependencies]
+# The solver crate, compiled as a native library (not wasm).
+# wasm_bindgen compiles away cleanly on non-wasm targets.
+sokoban-utils = { path = "../crate" }
+
+# Rayon: data-parallel iterators backed by a work-stealing thread pool.
+rayon = "1"
+
+# csv: fast, zero-copy CSV writing.
+csv = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

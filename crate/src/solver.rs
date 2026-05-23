@@ -38,6 +38,12 @@ pub struct Solver {
     goals: BitPlane,
     dead: BitPlane,
     goal_distances: Vec<Vec<u32>>,
+    /// `tunnel_data[flat][d]` is `true` when pushing a box onto cell `flat`
+    /// arriving from DIRS[d] should be extended further in that same direction.
+    /// A cell qualifies when it is a non-goal corridor: walled on both sides
+    /// perpendicular to the push direction, not a dead square, and the next
+    /// cell in the push direction is also a legal, non-dead, non-goal square.
+    tunnel_data: Vec<[bool; 4]>,
 }
 
 #[wasm_bindgen]
@@ -48,6 +54,7 @@ impl Solver {
         let goal_distances = precompute_goal_distances(
             &level.walls, &level.goals, level.width, level.height,
         );
+        let tunnel_data = compute_tunnels(&level.walls, &level.goals, &dead, level.width, level.height);
         Solver {
             width: level.width,
             height: level.height,
@@ -55,6 +62,7 @@ impl Solver {
             goals: level.goals.clone(),
             dead,
             goal_distances,
+            tunnel_data,
         }
     }
 
@@ -65,7 +73,7 @@ impl Solver {
             level.player_pos, &initial_boxes,
         );
 
-        let initial_state = State { boxes: initial_boxes, player_norm: initial_player };
+        let initial_state = State { boxes: initial_boxes.clone(), player_norm: initial_player };
 
         if self.is_solved(&initial_state.boxes) {
             return SolverResult { solved: true, push_count: 0, pushes: vec![], moves: String::new() };
@@ -119,8 +127,8 @@ impl Solver {
 
                 new_boxes.set(push.to_x, push.to_y);
 
-                // Prune: 2×2 freeze deadlock
-                if is_2x2_deadlock(&new_boxes, &self.walls, &self.goals, push.to_x, push.to_y) {
+                // Prune: freeze deadlock (biaxial chain detection)
+                if is_freeze_deadlock(push.to_x, push.to_y, &new_boxes, &self.walls, &self.goals) {
                     continue;
                 }
 
@@ -129,7 +137,7 @@ impl Solver {
                 );
 
                 let new_state = State { boxes: new_boxes, player_norm: new_player_norm };
-                let g = node.cost + 1;
+                let g = node.cost + push.steps;
                 let h = self.heuristic(&new_state.boxes);
                 let mut new_path = node.path.clone();
                 new_path.push(push);
@@ -158,6 +166,8 @@ struct Push {
     to_y: u8,
     /// Flat index of the cell the player must stand on to make this push.
     from_flat: usize,
+    /// Number of individual box-push steps (≥1; >1 for tunnel macro-pushes).
+    steps: u32,
 }
 
 #[derive(Eq, PartialEq)]
@@ -220,6 +230,10 @@ impl Solver {
     }
 
     /// Generate all valid pushes from a search state.
+    /// Pushes that enter a tunnel square are extended to the far end of the
+    /// tunnel as a single macro-push (the box passes through intermediate
+    /// squares without stopping).  This reduces the branching factor on
+    /// corridor-heavy levels without affecting correctness.
     fn generate_pushes(&self, state: &State) -> Vec<Push> {
         let px = (state.player_norm as usize % self.width as usize) as u8;
         let py = (state.player_norm as usize / self.width as usize) as u8;
@@ -227,7 +241,7 @@ impl Solver {
         let mut pushes = Vec::new();
 
         for (bx, by) in state.boxes.iter_set_bits() {
-            for (dx, dy) in DIRS {
+            for (dir_idx, &(dx, dy)) in DIRS.iter().enumerate() {
                 let push_from_x = bx as i8 - dx;
                 let push_from_y = by as i8 - dy;
                 let push_to_x   = bx as i8 + dx;
@@ -237,14 +251,31 @@ impl Solver {
                 if !in_bounds(self.width, self.height, push_to_x,   push_to_y)   { continue; }
 
                 let (pfx, pfy) = (push_from_x as u8, push_from_y as u8);
-                let (ptx, pty) = (push_to_x   as u8, push_to_y   as u8);
+                let (mut ptx, mut pty) = (push_to_x as u8, push_to_y as u8);
 
-                if !reachable.get(pfx, pfy)      { continue; }
-                if self.walls.get(ptx, pty)       { continue; }
-                if state.boxes.get(ptx, pty)      { continue; }
+                if !reachable.get(pfx, pfy)    { continue; }
+                if self.walls.get(ptx, pty)    { continue; }
+                if state.boxes.get(ptx, pty)   { continue; }
+
+                // Extend through tunnel squares: keep advancing in (dx,dy) while
+                // the current landing square is a tunnel for this direction AND
+                // the next square is free (not a wall, not a box).
+                let mut steps = 1u32;
+                loop {
+                    let flat = pty as usize * self.width as usize + ptx as usize;
+                    if !self.tunnel_data[flat][dir_idx] { break; }
+                    let nx = ptx as i8 + dx;
+                    let ny = pty as i8 + dy;
+                    if !in_bounds(self.width, self.height, nx, ny) { break; }
+                    let (nx, ny) = (nx as u8, ny as u8);
+                    if self.walls.get(nx, ny) || state.boxes.get(nx, ny) { break; }
+                    ptx = nx;
+                    pty = ny;
+                    steps += 1;
+                }
 
                 let from_flat = pfy as usize * self.width as usize + pfx as usize;
-                pushes.push(Push { from_x: bx, from_y: by, to_x: ptx, to_y: pty, from_flat });
+                pushes.push(Push { from_x: bx, from_y: by, to_x: ptx, to_y: pty, from_flat, steps });
             }
         }
         pushes
@@ -330,6 +361,75 @@ fn compute_dead_squares(walls: &BitPlane, goals: &BitPlane, width: u8, height: u
     }
 
     dead
+}
+
+// ── Tunnel precomputation ──────────────────────────────────────────────────
+
+/// For each cell and each of the 4 push directions, return whether arriving
+/// at that cell from that direction puts the box in a "tunnel" that should be
+/// extended further.
+///
+/// A cell `c` is a tunnel for direction `d` when ALL of:
+///   1. `c` is not a wall, not a dead square, and not a goal.
+///   2. The two cells perpendicular to `d` at `c` are both walls or out-of-bounds.
+///   3. The next cell `c + d` is reachable (not a wall, not dead, not out-of-bounds).
+///
+/// Condition 2 is the corridor test: walls on both sides perpendicular to
+/// the push mean there is no reason to stop here — the box must continue.
+/// Goals are excluded because the player may intentionally stop a box there.
+fn compute_tunnels(
+    walls: &BitPlane,
+    goals: &BitPlane,
+    dead: &BitPlane,
+    width: u8, height: u8,
+) -> Vec<[bool; 4]> {
+    let cells = width as usize * height as usize;
+    let mut out = vec![[false; 4]; cells];
+
+    // Perpendicular direction pairs: for DIRS[i] = (dx,dy), the perpendicular
+    // cells along the other axis are at offsets (±perp_dx, ±perp_dy).
+    // DIRS = [(0,-1),(0,1),(-1,0),(1,0)]
+    // perps[i] = the two perpendicular unit vectors for DIRS[i]
+    let perps: [[(i8, i8); 2]; 4] = [
+        [(-1, 0), (1, 0)], // for (0,-1) up   → left and right
+        [(-1, 0), (1, 0)], // for (0, 1) down → left and right
+        [(0, -1), (0, 1)], // for (-1,0) left → up and down
+        [(0, -1), (0, 1)], // for (1, 0) right→ up and down
+    ];
+
+    for y in 0..height {
+        for x in 0..width {
+            if walls.get(x, y) || dead.get(x, y) || goals.get(x, y) { continue; }
+            let flat = y as usize * width as usize + x as usize;
+
+            for (dir_idx, &(dx, dy)) in DIRS.iter().enumerate() {
+                // Next cell in push direction must be legal.
+                let nx = x as i8 + dx;
+                let ny = y as i8 + dy;
+                if !in_bounds(width, height, nx, ny) { continue; }
+                let (nx, ny) = (nx as u8, ny as u8);
+                if walls.get(nx, ny) || dead.get(nx, ny) { continue; }
+
+                // Both perpendicular neighbours at the current cell must be walls
+                // (or out-of-bounds — treated as walls for this purpose).
+                let [(pdx0, pdy0), (pdx1, pdy1)] = perps[dir_idx];
+                let p0x = x as i8 + pdx0;
+                let p0y = y as i8 + pdy0;
+                let p1x = x as i8 + pdx1;
+                let p1y = y as i8 + pdy1;
+
+                let p0_wall = !in_bounds(width, height, p0x, p0y)
+                    || walls.get(p0x as u8, p0y as u8);
+                let p1_wall = !in_bounds(width, height, p1x, p1y)
+                    || walls.get(p1x as u8, p1y as u8);
+
+                if p0_wall && p1_wall {
+                    out[flat][dir_idx] = true;
+                }
+            }
+        }
+    }
+    out
 }
 
 // ── Goal distance precomputation ───────────────────────────────────────────
@@ -456,49 +556,126 @@ fn reconstruct_moves(
             });
         }
 
-        // The push itself — direction is box movement (= player movement direction).
-        let dx = push.to_x as i8 - push.from_x as i8;
-        let dy = push.to_y as i8 - push.from_y as i8;
-        moves.push(match (dx, dy) {
+        // The push itself.  For a tunnel macro-push the box may have moved
+        // multiple squares in one step, so we output one uppercase LURD
+        // character per square travelled.
+        let total_dx = push.to_x as i32 - push.from_x as i32;
+        let total_dy = push.to_y as i32 - push.from_y as i32;
+        let dx_unit  = total_dx.signum();
+        let dy_unit  = total_dy.signum();
+        let steps    = (total_dx.abs() + total_dy.abs()) as usize;
+        let push_ch  = match (dx_unit, dy_unit) {
             ( 0, -1) => 'U',
             ( 0,  1) => 'D',
             (-1,  0) => 'L',
             ( 1,  0) => 'R',
             _ => '?',
-        });
+        };
+        for _ in 0..steps { moves.push(push_ch); }
 
-        // After the push: box moves to (to_x, to_y), player stands at old box cell.
+        // After the push: box at (to_x, to_y); player is one step behind the
+        // box's final position (they followed the box through the tunnel).
         boxes.clear(push.from_x, push.from_y);
         boxes.set(push.to_x, push.to_y);
-        player_pos = push.from_y as u16 * width as u16 + push.from_x as u16;
+        let final_px = (push.to_x as i32 - dx_unit) as u16;
+        let final_py = (push.to_y as i32 - dy_unit) as u16;
+        player_pos = final_py * width as u16 + final_px;
     }
 
     moves
 }
 
-// ── 2×2 deadlock detection ─────────────────────────────────────────────────
+// ── Freeze deadlock detection ──────────────────────────────────────────────
+//
+// A box is frozen if it cannot be moved: blocked along both the horizontal
+// and the vertical axis simultaneously.  A box is blocked along an axis when
+// *either* neighbour along that axis is a wall (which prevents both push
+// directions on that axis — a wall on one side blocks the player from
+// reaching the other side).  The check recurses through chains of adjacent
+// boxes; cycles are treated as frozen (mutually-blocking groups are frozen).
+//
+// This is the Rust equivalent of YASS's `IsAFreezingMove` / `BoxIsBlockedAlongOneAxis`.
 
-fn is_2x2_deadlock(
-    boxes: &BitPlane, walls: &BitPlane, goals: &BitPlane,
-    bx: u8, by: u8,
+/// Returns `true` if placing a box at `(to_x, to_y)` creates a frozen group
+/// that contains at least one box not sitting on a goal.
+///
+/// `boxes` must already reflect the push (box at `to_x,to_y`).
+fn is_freeze_deadlock(
+    to_x: u8, to_y: u8,
+    boxes: &BitPlane,
+    walls: &BitPlane,
+    goals: &BitPlane,
 ) -> bool {
-    for (ox, oy) in [(0u8, 0u8), (1, 0), (0, 1), (1, 1)] {
-        let cx = bx.saturating_sub(ox);
-        let cy = by.saturating_sub(oy);
-        let w = boxes.width;
-        let h = boxes.height;
-        if cx + 1 >= w || cy + 1 >= h { continue; }
-        let all_blocked = (0..2u8).all(|i| (0..2u8).all(|j| {
-            let nx = cx + i;
-            let ny = cy + j;
-            walls.get(nx, ny) || boxes.get(nx, ny)
-        }));
-        if all_blocked {
-            let all_goals = (0..2u8).all(|i| (0..2u8).all(|j| {
-                goals.get(cx + i, cy + j)
-            }));
-            if !all_goals { return true; }
+    let w = walls.width;
+    let h = walls.height;
+    let cells = w as usize * h as usize;
+
+    // Per-cell state:  0 = unchecked  1 = in-progress  2 = not-blocked  3 = blocked
+    let mut ch = vec![0u8; cells]; // horizontal axis cache
+    let mut cv = vec![0u8; cells]; // vertical axis cache
+
+    if !blocked_axis(to_x, to_y, true,  boxes, walls, w, h, &mut ch) { return false; }
+    if !blocked_axis(to_x, to_y, false, boxes, walls, w, h, &mut cv) { return false; }
+
+    // There must be at least one non-goal box in the frozen group, otherwise
+    // all frozen boxes are already on their goals and that is fine.
+    for flat in 0..cells {
+        if ch[flat] == 3 && cv[flat] == 3 {
+            let bx = (flat % w as usize) as u8;
+            let by = (flat / w as usize) as u8;
+            if boxes.get(bx, by) && !goals.get(bx, by) {
+                return true;
+            }
         }
     }
     false
+}
+
+/// Returns `true` if the box at `(x, y)` cannot escape along the given axis.
+///
+/// `horizontal = true`  → checks the left/right axis.
+/// `horizontal = false` → checks the up/down axis.
+///
+/// The in-progress marker (1) breaks cycles: if A depends on B and B on A,
+/// both are treated as frozen, which is correct — they mutually block each other.
+fn blocked_axis(
+    x: u8, y: u8,
+    horizontal: bool,
+    boxes: &BitPlane,
+    walls: &BitPlane,
+    width: u8, height: u8,
+    cache: &mut [u8],
+) -> bool {
+    let idx = y as usize * width as usize + x as usize;
+    match cache[idx] {
+        3 => return true,
+        2 => return false,
+        1 => return true, // in-progress → cycle → treat as frozen
+        _ => {}
+    }
+    cache[idx] = 1; // mark in-progress
+
+    let result = if horizontal {
+        // Blocked on the left side?
+        let left = x == 0 || walls.get(x - 1, y)
+            || (boxes.get(x - 1, y)
+                && blocked_axis(x - 1, y, true, boxes, walls, width, height, cache));
+        // Blocked on the right side?
+        let right = x + 1 >= width || walls.get(x + 1, y)
+            || (boxes.get(x + 1, y)
+                && blocked_axis(x + 1, y, true, boxes, walls, width, height, cache));
+        // Either side blocked → the box cannot be pushed in either horizontal direction.
+        left || right
+    } else {
+        let up = y == 0 || walls.get(x, y - 1)
+            || (boxes.get(x, y - 1)
+                && blocked_axis(x, y - 1, false, boxes, walls, width, height, cache));
+        let down = y + 1 >= height || walls.get(x, y + 1)
+            || (boxes.get(x, y + 1)
+                && blocked_axis(x, y + 1, false, boxes, walls, width, height, cache));
+        up || down
+    };
+
+    cache[idx] = if result { 3 } else { 2 };
+    result
 }

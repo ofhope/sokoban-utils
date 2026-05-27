@@ -192,9 +192,11 @@ mod tests {
         let level = SokobanLevel::from_xsb(SIMPLE).expect("parse failed");
         assert_eq!(level.width, 7);
         assert_eq!(level.height, 5);
+        // SIMPLE row 0 = "  #####": wall at x=2 ✓
+        // SIMPLE row 2 = "# $@. #": box='$' at x=2, player='@' at x=3, goal='.' at x=4
         assert!(level.is_wall(2, 0));
-        assert!(level.is_box(3, 2));
-        assert!(level.is_goal(5, 2));
+        assert!(level.is_box(2, 2));
+        assert!(level.is_goal(4, 2));
         let back = level.to_xsb();
         let re = SokobanLevel::from_xsb(&back).expect("re-parse failed");
         assert_eq!(re.player_pos, level.player_pos);

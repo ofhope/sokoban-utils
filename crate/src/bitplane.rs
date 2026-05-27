@@ -77,9 +77,14 @@ impl BitPlane {
 
     /// RLE encode: alternating runs of 0-bits then 1-bits.
     /// Each run length uses 4-bit nibbles; 0xF means "add next nibble".
+    ///
+    /// All runs contribute nibbles to a single shared stream which is then
+    /// packed two-per-byte.  Keeping a single nibble stream is essential:
+    /// packing each run independently would misalign the decoder (odd-nibble
+    /// runs would zero-pad to a full byte, creating phantom runs of length 0).
     pub fn rle_encode(&self) -> Vec<u8> {
         let total = self.len();
-        let mut out = Vec::new();
+        let mut nibbles: Vec<u8> = Vec::new();
         let mut current = false; // first run is 0s
         let mut run: u32 = 0;
 
@@ -87,12 +92,22 @@ impl BitPlane {
             if self.get_flat(i) == current {
                 run += 1;
             } else {
-                encode_run(&mut out, run);
+                push_run_nibbles(&mut nibbles, run);
                 current = !current;
                 run = 1;
             }
         }
-        encode_run(&mut out, run);
+        push_run_nibbles(&mut nibbles, run);
+
+        // Pack all nibbles into bytes (last nibble zero-padded if count is odd).
+        let mut out = Vec::with_capacity((nibbles.len() + 1) / 2);
+        for chunk in nibbles.chunks(2) {
+            out.push(if chunk.len() == 2 {
+                (chunk[0] << 4) | chunk[1]
+            } else {
+                chunk[0] << 4
+            });
+        }
         out
     }
 
@@ -126,12 +141,9 @@ impl BitPlane {
     }
 }
 
-fn encode_run(out: &mut Vec<u8>, mut run: u32) {
-    // Encode as sequence of 4-bit nibbles packed into bytes.
-    // We buffer nibbles and flush pairs.
-    // A nibble value of 15 means "another nibble follows (add 15 and continue)".
-    // This is simpler: just emit nibbles and pack them.
-    let mut nibbles: Vec<u8> = Vec::new();
+/// Append the nibble encoding of `run` to `nibbles`.
+/// Values < 15 are a single nibble; 15 means "add the next nibble too".
+fn push_run_nibbles(nibbles: &mut Vec<u8>, mut run: u32) {
     loop {
         if run < 15 {
             nibbles.push(run as u8);
@@ -139,13 +151,6 @@ fn encode_run(out: &mut Vec<u8>, mut run: u32) {
         } else {
             nibbles.push(15);
             run -= 15;
-        }
-    }
-    for chunk in nibbles.chunks(2) {
-        if chunk.len() == 2 {
-            out.push((chunk[0] << 4) | chunk[1]);
-        } else {
-            out.push(chunk[0] << 4);
         }
     }
 }

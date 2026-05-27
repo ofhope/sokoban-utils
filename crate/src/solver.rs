@@ -1506,4 +1506,101 @@ mod tests {
             "expected bare-goal corral to be left unpruned",
         );
     }
+
+    // ── is_freeze_deadlock ─────────────────────────────────────────────────
+    //
+    // These guard the freeze check directly.  It had no unit coverage before,
+    // which is how a latent unsoundness (treating a box as blocked along an
+    // axis when an adjacent box was blocked only on that *same* axis) survived
+    // unnoticed — it only mattered once `corral_prune` started seeding the
+    // check at fence boxes rather than just the freshly pushed box.
+
+    /// Helper: run the freeze check using a solver's precomputed planes.
+    fn freeze(solver: &Solver, boxes: &BitPlane, x: u8, y: u8) -> bool {
+        is_freeze_deadlock(x, y, boxes, &solver.walls, &solver.goals, &solver.dead)
+    }
+
+    /// A box wedged into a corner (wall left + wall above), not on a goal, is a
+    /// genuine freeze deadlock.
+    ///
+    /// ```text
+    /// ####
+    /// #$ #
+    /// #  #
+    /// ####
+    /// ```
+    #[test]
+    fn freeze_corner_is_deadlock() {
+        let level = SokobanLevel::from_xsb("####\n#$ #\n#  #\n####").expect("parse");
+        let solver = Solver::new(&level);
+        assert!(freeze(&solver, &level.boxes, 1, 1),
+            "a non-goal box in a wall corner must be a freeze deadlock");
+    }
+
+    /// The same corner, but the box is already on a goal (`*`).  A frozen group
+    /// whose every box sits on a goal is not a deadlock.
+    ///
+    /// ```text
+    /// ####
+    /// #* #
+    /// #  #
+    /// ####
+    /// ```
+    #[test]
+    fn freeze_corner_on_goal_is_ok() {
+        let level = SokobanLevel::from_xsb("####\n#* #\n#  #\n####").expect("parse");
+        let solver = Solver::new(&level);
+        assert!(!freeze(&solver, &level.boxes, 1, 1),
+            "a frozen box that sits on a goal must NOT be reported as a deadlock");
+    }
+
+    /// Recursive (chain) freeze: box B at (2,1) has open floor to its right, so
+    /// it is only blocked horizontally *because* its left neighbour A at (1,1)
+    /// is itself fully frozen (wedged against walls on all relevant sides).
+    /// The two-axis neighbour recursion must still detect this real deadlock.
+    ///
+    /// ```text
+    /// #####
+    /// #$$ #
+    /// #####
+    /// ```
+    #[test]
+    fn freeze_recursive_pair_is_deadlock() {
+        let level = SokobanLevel::from_xsb("#####\n#$$ #\n#####").expect("parse");
+        let solver = Solver::new(&level);
+        assert!(freeze(&solver, &level.boxes, 2, 1),
+            "box blocked via a fully-frozen neighbour must be a freeze deadlock");
+    }
+
+    /// Regression guard for the corral false positive (mirrors the level-15
+    /// configuration that broke the solver).  Box B at (3,2) has a wall on its
+    /// right and box A at (3,1) directly above it.  A has a wall above but is
+    /// free to slide left/right — so A can vacate and B can later be pushed
+    /// down.  B is therefore NOT frozen.
+    ///
+    /// The previous freeze check wrongly reported B as frozen because it
+    /// considered A "vertically blocked" (wall above A) without checking that
+    /// A could still escape horizontally.  The fix requires a neighbour box to
+    /// be frozen on BOTH axes before it counts as a blocker.
+    ///
+    /// ```text
+    /// ######
+    /// #. $ #   A = box at (3,1)
+    /// #. $##   B = box at (3,2), wall at (4,2)
+    /// #  @ #
+    /// ######
+    /// ```
+    #[test]
+    fn freeze_not_fooled_by_slidable_neighbour() {
+        let level = SokobanLevel::from_xsb(
+            "######\n#. $ #\n#. $##\n#  @ #\n######",
+        ).expect("parse");
+        let solver = Solver::new(&level);
+        // Sanity: the slidable neighbour A itself is not frozen.
+        assert!(!freeze(&solver, &level.boxes, 3, 1),
+            "neighbour A can slide horizontally, so it is not frozen");
+        // The actual regression guard: B must not be a false freeze deadlock.
+        assert!(!freeze(&solver, &level.boxes, 3, 2),
+            "B must not be reported frozen — its neighbour can slide away");
+    }
 }

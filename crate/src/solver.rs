@@ -277,16 +277,31 @@ impl Solver {
         self.goals.iter_set_bits().all(|(x, y)| boxes.get(x, y))
     }
 
-    /// A* heuristic: sum of each box's minimum push-distance to nearest goal.
+    /// A* heuristic: minimum-cost bipartite matching between boxes and goals.
+    ///
+    /// Uses the Hungarian algorithm (O(n³)) to find the optimal box→goal
+    /// assignment.  This is strictly tighter than the greedy "sum of nearest
+    /// goals" approach: the greedy sum treats each box independently and may
+    /// implicitly assign two boxes to the same goal, whereas the matching
+    /// enforces uniqueness.
+    ///
+    /// Both are admissible lower bounds — the greedy sum ≤ optimal matching
+    /// cost ≤ true remaining cost — but the matching heuristic dominates the
+    /// greedy one and therefore prunes more branches from the A* heap.
     fn heuristic(&self, boxes: &BitPlane) -> u32 {
-        boxes.iter_set_bits().map(|(bx, by)| {
-            let flat = by as usize * self.width as usize + bx as usize;
-            self.goal_distances
-                .iter()
-                .map(|gdist| gdist[flat])
-                .min()
-                .unwrap_or(u32::MAX / 2)
-        }).sum()
+        let box_flats: Vec<usize> = boxes
+            .iter_set_bits()
+            .map(|(x, y)| y as usize * self.width as usize + x as usize)
+            .collect();
+
+        let n_boxes = box_flats.len();
+        let n_goals = self.goal_distances.len();
+
+        if n_boxes == 0 { return 0; }
+
+        hungarian_matching(n_boxes, n_goals, |bi, gi| {
+            self.goal_distances[gi][box_flats[bi]]
+        })
     }
 
     /// Normalise player position to the top-left-most reachable cell.
@@ -815,6 +830,130 @@ fn find_min_closure(
     Some(cells)
 }
 
+// ── Bipartite matching heuristic ──────────────────────────────────────────
+//
+// The greedy "sum of nearest goals" heuristic picks the closest goal for each
+// box independently.  Because two boxes can silently share the same goal in
+// this estimate, the sum can lie strictly below the true push cost.  The
+// optimal box→goal assignment (computed once per A* node) is always ≥ the
+// greedy sum, so it is still an admissible lower bound while being strictly
+// tighter — it prunes more of the A* search tree.
+//
+// Algorithm: classic potential-based shortest-path augmentation (Kuhn–Munkres /
+// Jonker–Volgenant style), O(n²·m) with n workers and m jobs.  For the small
+// n typical in Sokoban (≤ ~20 boxes) this is negligible per node.
+//
+// Correctness note: the algorithm maintains complementary slackness throughout
+// augmentation, so the final assignment is provably optimal (exact minimum
+// cost, not just ε-optimal).  Unreachable box→goal pairs are encoded as
+// INFEASIBLE (u32::MAX / 2); if any box cannot reach any goal the heuristic
+// returns INFEASIBLE, signalling a deadlock to the caller.
+
+/// Solve the minimum-cost assignment problem.
+///
+/// Assigns each of the `n_workers` boxes to a **distinct** goal drawn from
+/// `n_jobs` goals (`n_workers ≤ n_jobs`).  `cost_fn(worker, job)` returns the
+/// push-distance; `u32::MAX` (or any value ≥ `u32::MAX / 2`) marks a pair as
+/// infeasible (that goal is unreachable from that box position).
+///
+/// Returns the total cost of the optimal assignment, or `u32::MAX / 2` when
+/// no perfect matching of boxes to distinct goals exists.
+fn hungarian_matching(
+    n_workers: usize,
+    n_jobs: usize,
+    cost_fn: impl Fn(usize, usize) -> u32,
+) -> u32 {
+    const INFEASIBLE: u32 = u32::MAX / 2;
+    const INF: i64 = i64::MAX / 4;
+
+    if n_workers == 0 { return 0; }
+    if n_workers > n_jobs { return INFEASIBLE; }
+
+    // Dual variables (potentials): u[i] for workers (1-indexed), v[j] for jobs.
+    // These enforce complementary slackness throughout the augmentation loop.
+    let mut u = vec![0i64; n_workers + 1];
+    let mut v = vec![0i64; n_jobs + 1];
+
+    // p[j] = worker currently assigned to job j  (0 = unassigned).
+    // Index 0 is a virtual "free" job used as the augmentation source.
+    let mut p = vec![0usize; n_jobs + 1];
+
+    // way[j] = predecessor job on the shortest augmenting path reaching j.
+    let mut way = vec![0usize; n_jobs + 1];
+
+    for i in 1..=n_workers {
+        // Augment for worker i: find the cheapest augmenting path starting from
+        // the virtual source (job 0, which "holds" worker i) to any unmatched
+        // real job, then flip the path to extend the matching by one edge.
+        p[0] = i;
+        let mut j0 = 0usize; // current job on the path
+
+        // min_val[j]: cheapest reduced cost to reach job j from the current path.
+        let mut min_val = vec![INF; n_jobs + 1];
+        let mut used = vec![false; n_jobs + 1]; // jobs already on the path
+
+        loop {
+            used[j0] = true;
+            let i0 = p[j0]; // the worker sitting at job j0
+            let mut delta = INF;
+            let mut j1 = 0usize; // next job to extend the path to
+
+            for j in 1..=n_jobs {
+                if !used[j] {
+                    let raw = cost_fn(i0 - 1, j - 1);
+                    let c: i64 = if raw >= INFEASIBLE { INF } else { raw as i64 };
+                    // Reduced cost: actual_cost - worker_potential - job_potential.
+                    let val = c - u[i0] - v[j];
+                    if val < min_val[j] {
+                        min_val[j] = val;
+                        way[j] = j0;
+                    }
+                    if min_val[j] < delta {
+                        delta = min_val[j];
+                        j1 = j;
+                    }
+                }
+            }
+
+            if delta >= INF / 2 {
+                return INFEASIBLE; // no perfect matching exists
+            }
+
+            // Update potentials to keep complementary slackness intact.
+            for j in 0..=n_jobs {
+                if used[j] {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                } else {
+                    min_val[j] -= delta;
+                }
+            }
+
+            j0 = j1;
+            if p[j0] == 0 { break; } // j1 was unmatched — augmenting path found
+        }
+
+        // Flip the augmenting path to extend the matching.
+        loop {
+            let j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+            if j0 == 0 { break; }
+        }
+    }
+
+    // Sum the actual (un-reduced) costs of the optimal assignment.
+    let mut total = 0u32;
+    for j in 1..=n_jobs {
+        if p[j] > 0 {
+            let c = cost_fn(p[j] - 1, j - 1);
+            if c >= INFEASIBLE { return INFEASIBLE; }
+            total = total.saturating_add(c);
+        }
+    }
+    total
+}
+
 // ── Goal distance precomputation ───────────────────────────────────────────
 
 fn precompute_goal_distances(
@@ -1088,4 +1227,105 @@ fn blocked_axis(
 
     cache[idx] = if result { 3 } else { 2 };
     result
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── hungarian_matching ─────────────────────────────────────────────────
+
+    #[test]
+    fn hungarian_zero_workers() {
+        assert_eq!(hungarian_matching(0, 0, |_, _| 0u32), 0);
+        assert_eq!(hungarian_matching(0, 3, |_, _| 5u32), 0);
+    }
+
+    #[test]
+    fn hungarian_single_pair() {
+        assert_eq!(hungarian_matching(1, 1, |_, _| 7u32), 7);
+    }
+
+    #[test]
+    fn hungarian_single_infeasible() {
+        // The only goal is unreachable.
+        assert_eq!(hungarian_matching(1, 1, |_, _| u32::MAX), u32::MAX / 2);
+    }
+
+    #[test]
+    fn hungarian_more_goals_than_boxes() {
+        // 1 box, 3 goals: cheapest is goal 1 (cost 2).
+        let costs = [10u32, 2, 8];
+        assert_eq!(hungarian_matching(1, 3, |_, gi| costs[gi]), 2);
+    }
+
+    /// Key correctness test: show that the matching gives the true optimum,
+    /// which is HIGHER than the greedy "sum of individual minimums".
+    ///
+    /// Cost matrix:
+    ///              goal 0   goal 1
+    ///   box 0:       1       10
+    ///   box 1:       2        3
+    ///
+    /// Greedy sum-of-min = min(1,10) + min(2,3) = 1 + 2 = 3
+    ///
+    /// Optimal matching:
+    ///   box0→goal0 (1) + box1→goal1 (3) = 4   ← chosen
+    ///   box0→goal1 (10) + box1→goal0 (2) = 12
+    ///
+    /// The matching heuristic returns 4, which is a strictly tighter lower
+    /// bound than the greedy 3.
+    #[test]
+    fn hungarian_tighter_than_greedy() {
+        let costs = [[1u32, 10], [2u32, 3]];
+        let result = hungarian_matching(2, 2, |bi, gi| costs[bi][gi]);
+        assert_eq!(result, 4);
+
+        // Confirm greedy underestimates (it would return 3).
+        let greedy: u32 = costs.iter().map(|row| *row.iter().min().unwrap()).sum();
+        assert_eq!(greedy, 3);
+        assert!(result > greedy);
+    }
+
+    #[test]
+    fn hungarian_3x3_known_optimum() {
+        // Cost matrix — exhaustive enumeration shown below.
+        //          goal 0  goal 1  goal 2
+        // box 0:     3       4       5
+        // box 1:     7       8       1
+        // box 2:     2       6       9
+        //
+        // All 3! = 6 perfect matchings:
+        //   0→0, 1→1, 2→2:  3+8+9 = 20
+        //   0→0, 1→2, 2→1:  3+1+6 = 10
+        //   0→1, 1→0, 2→2:  4+7+9 = 20
+        //   0→1, 1→2, 2→0:  4+1+2 =  7  ← optimal
+        //   0→2, 1→0, 2→1:  5+7+6 = 18
+        //   0→2, 1→1, 2→0:  5+8+2 = 15
+        let costs = [[3u32, 4, 5], [7u32, 8, 1], [2u32, 6, 9]];
+        assert_eq!(hungarian_matching(3, 3, |bi, gi| costs[bi][gi]), 7);
+    }
+
+    #[test]
+    fn hungarian_identity_matrix() {
+        // n×n identity: optimal is the diagonal, cost = 0 * n.
+        // Use costs: diagonal = 0, off-diagonal = 100.
+        let n = 5usize;
+        let result = hungarian_matching(n, n, |bi, gi| if bi == gi { 0 } else { 100 });
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn hungarian_all_equal() {
+        // All costs equal → any matching is optimal; total = n * cost.
+        let result = hungarian_matching(4, 4, |_, _| 6u32);
+        assert_eq!(result, 24);
+    }
+
+    #[test]
+    fn hungarian_workers_exceed_jobs_infeasible() {
+        assert_eq!(hungarian_matching(3, 2, |_, _| 1u32), u32::MAX / 2);
+    }
 }

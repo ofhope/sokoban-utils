@@ -210,7 +210,11 @@ mod tests {
         assert_eq!(restored.player_pos, level.player_pos);
     }
 
+    // JsValue::from_str() calls into wasm-bindgen glue that panics (non-
+    // unwindably) on native targets.  The CRC path is exercised in wasm
+    // integration tests; skip it here.
     #[test]
+    #[cfg(target_arch = "wasm32")]
     fn crc_detects_corruption() {
         let level = SokobanLevel::from_xsb(SIMPLE).expect("parse");
         let mut bytes = level.to_bytes();

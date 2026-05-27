@@ -82,6 +82,42 @@ impl Solver {
         }
     }
 
+    /// Return a human-readable diagnostic string about the precomputed deadlock sets.
+    ///
+    /// Useful for tuning: call this from TypeScript right after `Solver.new(level)`
+    /// and log the result to the console.
+    ///
+    /// Reports:
+    ///   - Total number of deadlock sets registered
+    ///   - Max number of set memberships any single cell has accumulated
+    ///   - Histogram of membership counts (how many cells have 0, 1, 2, … memberships)
+    pub fn set_diagnostics(&self) -> String {
+        let total_sets = self.deadlock_sets.len();
+
+        let counts: Vec<usize> = self.set_membership.iter().map(|v| v.len()).collect();
+        let max_count = counts.iter().copied().max().unwrap_or(0);
+
+        // Build a histogram up to max_count (capped at 10 buckets for readability).
+        let cap = max_count.min(10);
+        let mut hist = vec![0usize; cap + 2]; // bucket cap+1 = "more than cap"
+        for &c in &counts {
+            if c <= cap { hist[c] += 1; } else { hist[cap + 1] += 1; }
+        }
+
+        let mut out = format!(
+            "deadlock sets: {}  |  max memberships per cell: {}\n  histogram (memberships → cell count):\n",
+            total_sets, max_count,
+        );
+        for (i, &n) in hist.iter().enumerate() {
+            if i == cap + 1 {
+                out.push_str(&format!("    >{}  → {}\n", cap, n));
+            } else {
+                out.push_str(&format!("    {}  → {}\n", i, n));
+            }
+        }
+        out
+    }
+
     /// Run A* over push states. Returns None (unsolvable or limit hit) via solved=false.
     pub fn solve(&self, level: &SokobanLevel, max_nodes: u32) -> SolverResult {
         let initial_boxes = level.boxes.clone();

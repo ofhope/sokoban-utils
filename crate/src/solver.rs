@@ -192,6 +192,10 @@ impl Solver {
                     continue;
                 }
 
+                // Prune: corral with deadlocked fence box.
+                // Pass the player's position after the push (= old box cell).
+                if self.corral_prune(push.from_flat as u16, &new_boxes) { continue; }
+
                 let new_player_norm = self.normalise_player(
                     push.from_flat as u16, &new_boxes,
                 );
@@ -1134,11 +1138,14 @@ fn is_freeze_deadlock(
     let cells = w as usize * h as usize;
 
     // Per-cell state:  0 = unchecked  1 = in-progress  2 = not-blocked  3 = blocked
+    // Both caches are threaded through every recursive call because deciding
+    // whether a *neighbour* box blocks us now requires knowing whether that
+    // neighbour is frozen on BOTH axes (see `blocked_axis`).
     let mut ch = vec![0u8; cells]; // horizontal axis cache
     let mut cv = vec![0u8; cells]; // vertical axis cache
 
-    if !blocked_axis(to_x, to_y, true,  boxes, walls, dead, w, h, &mut ch) { return false; }
-    if !blocked_axis(to_x, to_y, false, boxes, walls, dead, w, h, &mut cv) { return false; }
+    if !blocked_axis(to_x, to_y, true,  boxes, walls, dead, w, h, &mut ch, &mut cv) { return false; }
+    if !blocked_axis(to_x, to_y, false, boxes, walls, dead, w, h, &mut ch, &mut cv) { return false; }
 
     // There must be at least one non-goal box in the frozen group, otherwise
     // all frozen boxes are already on their goals and that is fine.
@@ -1164,11 +1171,25 @@ fn is_freeze_deadlock(
 ///   - Both neighbours along that axis are dead squares (YASS `FLAG_ILLEGAL_BOX_SQUARE`):
 ///     pushing left would land on a dead square; same for right — so there is no
 ///     useful push in either direction.
-///   - A neighbouring box exists that is itself blocked along the same axis
-///     (biaxial chain recursion).
+///   - A neighbouring box exists that is itself **frozen** — i.e. blocked along
+///     *both* axes.
+///
+/// ## Why the neighbour must be frozen on BOTH axes
+///
+/// An adjacent box only *permanently* blocks us if it can never get out of the
+/// way.  A box that is blocked on this axis but free on the *other* axis can
+/// simply be pushed aside along that other axis, after which we are free to
+/// move.  Requiring only same-axis blocking (the previous behaviour) therefore
+/// produced **false freeze deadlocks**: e.g. a box with a wall on one side and
+/// such a one-axis-blocked neighbour on the other was wrongly reported frozen
+/// even though the neighbour could slide away.  This is the standard YASS /
+/// Sokoban-wiki freeze rule, and it is sound — it can only ever *miss* a
+/// deadlock, never invent one.
 ///
 /// The in-progress marker (1) breaks cycles: if A depends on B and B on A,
 /// both are treated as frozen, which is correct — they mutually block each other.
+/// Both axis caches (`ch`, `cv`) are threaded through so the two-axis neighbour
+/// test can reuse partial results and share the cycle markers.
 fn blocked_axis(
     x: u8, y: u8,
     horizontal: bool,
@@ -1176,17 +1197,24 @@ fn blocked_axis(
     walls: &BitPlane,
     dead: &BitPlane,
     width: u8, height: u8,
-    cache: &mut [u8],
+    ch: &mut [u8],
+    cv: &mut [u8],
 ) -> bool {
     let idx = y as usize * width as usize + x as usize;
-    match cache[idx] {
-        3 => return true,
-        2 => return false,
-        1 => return true, // in-progress → cycle → treat as frozen
-        _ => {}
+    {
+        let state = if horizontal { ch[idx] } else { cv[idx] };
+        match state {
+            3 => return true,
+            2 => return false,
+            1 => return true, // in-progress → cycle → treat as frozen
+            _ => {}
+        }
     }
-    cache[idx] = 1; // mark in-progress
+    if horizontal { ch[idx] = 1 } else { cv[idx] = 1 } // mark in-progress
 
+    // A neighbouring box blocks us only if it is fully frozen: blocked on both
+    // the horizontal AND the vertical axis.  We evaluate the two axes with `&`
+    // (not `&&`) so the recursion populates both caches, then combine.
     let result = if horizontal {
         let left_wall  = x == 0         || walls.get(x - 1, y);
         let right_wall = x + 1 >= width || walls.get(x + 1, y);
@@ -1198,14 +1226,18 @@ fn blocked_axis(
         let both_dead = !left_wall && !right_wall
             && dead.get(x - 1, y) && dead.get(x + 1, y);
 
-        // Only check for a frozen adjacent box when there is no wall on that side
+        // Only recurse into an adjacent box when there is no wall on that side
         // (a wall already blocks that direction; no need to recurse).
-        let left_frozen = !left_wall
-            && boxes.get(x - 1, y)
-            && blocked_axis(x - 1, y, true, boxes, walls, dead, width, height, cache);
-        let right_frozen = !right_wall
-            && boxes.get(x + 1, y)
-            && blocked_axis(x + 1, y, true, boxes, walls, dead, width, height, cache);
+        let left_frozen = !left_wall && boxes.get(x - 1, y) && {
+            let h_blk = blocked_axis(x - 1, y, true,  boxes, walls, dead, width, height, ch, cv);
+            let v_blk = blocked_axis(x - 1, y, false, boxes, walls, dead, width, height, ch, cv);
+            h_blk && v_blk
+        };
+        let right_frozen = !right_wall && boxes.get(x + 1, y) && {
+            let h_blk = blocked_axis(x + 1, y, true,  boxes, walls, dead, width, height, ch, cv);
+            let v_blk = blocked_axis(x + 1, y, false, boxes, walls, dead, width, height, ch, cv);
+            h_blk && v_blk
+        };
 
         left_wall || right_wall || both_dead || left_frozen || right_frozen
     } else {
@@ -1215,18 +1247,116 @@ fn blocked_axis(
         let both_dead = !up_wall && !down_wall
             && dead.get(x, y - 1) && dead.get(x, y + 1);
 
-        let up_frozen = !up_wall
-            && boxes.get(x, y - 1)
-            && blocked_axis(x, y - 1, false, boxes, walls, dead, width, height, cache);
-        let down_frozen = !down_wall
-            && boxes.get(x, y + 1)
-            && blocked_axis(x, y + 1, false, boxes, walls, dead, width, height, cache);
+        let up_frozen = !up_wall && boxes.get(x, y - 1) && {
+            let h_blk = blocked_axis(x, y - 1, true,  boxes, walls, dead, width, height, ch, cv);
+            let v_blk = blocked_axis(x, y - 1, false, boxes, walls, dead, width, height, ch, cv);
+            h_blk && v_blk
+        };
+        let down_frozen = !down_wall && boxes.get(x, y + 1) && {
+            let h_blk = blocked_axis(x, y + 1, true,  boxes, walls, dead, width, height, ch, cv);
+            let v_blk = blocked_axis(x, y + 1, false, boxes, walls, dead, width, height, ch, cv);
+            h_blk && v_blk
+        };
 
         up_wall || down_wall || both_dead || up_frozen || down_frozen
     };
 
-    cache[idx] = if result { 3 } else { 2 };
+    if horizontal { ch[idx] = if result { 3 } else { 2 } }
+    else          { cv[idx] = if result { 3 } else { 2 } }
     result
+}
+
+// ── Corral pruning ─────────────────────────────────────────────────────────
+//
+// A "corral" is a connected region of floor cells the player cannot reach in
+// the current state, bounded by boxes (the "fence") and walls.  Because no
+// fence box can be pushed outward — there is no player access on the outside
+// of those boxes — any box that ends up inside the corral is effectively
+// trapped there.
+//
+// Pruning criterion (conservative, no false positives):
+//   1. Identify each connected pocket of floor cells unreachable by the player.
+//   2. Safety guard: if the pocket contains a goal with no box on it, skip it —
+//      a box might still need to be pushed in, so we cannot conclude deadlock.
+//   3. Collect the "fence": every box adjacent to at least one pocket cell.
+//   4. If any fence box is already deadlocked (freeze or closed-set overflow),
+//      the state is a deadlock: the fence can never be removed.
+//
+// Reference: YASS `CorralPruning`, approximately line 17361.
+
+impl Solver {
+    /// Returns `true` if the position is provably a deadlock via corral analysis.
+    ///
+    /// `player_flat` — flat index of the player's position immediately after the
+    ///                 push (`push.from_flat as u16` — the old box cell).
+    /// `boxes`        — box bitplane already reflecting the completed push.
+    fn corral_prune(&self, player_flat: u16, boxes: &BitPlane) -> bool {
+        let px = (player_flat as usize % self.width as usize) as u8;
+        let py = (player_flat as usize / self.width as usize) as u8;
+
+        // Player's reachable floor region in the new state.
+        let reachable = flood_fill(px, py, &self.walls, boxes, self.width, self.height);
+
+        // Track interior cells already assigned to a corral pocket so we do
+        // not re-seed from them and process the same pocket twice.
+        let mut interior_seen = BitPlane::new(self.width, self.height);
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                // Candidate seed: floor cell, not a box, not player-reachable,
+                // not already part of a processed corral.
+                if self.walls.get(x, y) { continue; }
+                if boxes.get(x, y)      { continue; }
+                if reachable.get(x, y)  { continue; }
+                if interior_seen.get(x, y) { continue; }
+
+                // Flood-fill from this seed (obstacles = walls + boxes) to find
+                // the full corral pocket.
+                let interior = flood_fill(x, y, &self.walls, boxes, self.width, self.height);
+
+                // Mark all pocket cells so future seeds skip them.
+                for (ix, iy) in interior.iter_set_bits() {
+                    interior_seen.set(ix, iy);
+                }
+
+                // Safety guard: bare goal inside the pocket → skip.
+                // We may still need to push a box there, so we cannot safely
+                // declare a deadlock without deeper analysis.
+                let has_bare_goal = interior
+                    .iter_set_bits()
+                    .any(|(ix, iy)| self.goals.get(ix, iy) && !boxes.get(ix, iy));
+                if has_bare_goal { continue; }
+
+                // Collect fence boxes: boxes adjacent to at least one pocket cell.
+                let mut fence: Vec<(u8, u8)> = Vec::new();
+                for (ix, iy) in interior.iter_set_bits() {
+                    for &(dx, dy) in &DIRS {
+                        let nx = ix as i8 + dx;
+                        let ny = iy as i8 + dy;
+                        if !in_bounds(self.width, self.height, nx, ny) { continue; }
+                        let (nx, ny) = (nx as u8, ny as u8);
+                        if boxes.get(nx, ny) && !fence.contains(&(nx, ny)) {
+                            fence.push((nx, ny));
+                        }
+                    }
+                }
+
+                // If any fence box is already deadlocked, this state is unsolvable.
+                for &(fx, fy) in &fence {
+                    if self.has_set_deadlock(fx, fy, boxes) {
+                        return true;
+                    }
+                    if is_freeze_deadlock(
+                        fx, fy, boxes, &self.walls, &self.goals, &self.dead,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -1327,5 +1457,53 @@ mod tests {
     #[test]
     fn hungarian_workers_exceed_jobs_infeasible() {
         assert_eq!(hungarian_matching(3, 2, |_, _| 1u32), u32::MAX / 2);
+    }
+
+    // ── corral_prune ──────────────────────────────────────────────────────
+
+    /// A 3-row horizontal corridor: player is behind a box, free space beyond.
+    ///
+    /// ```text
+    /// #######
+    /// #@$   #
+    /// #######
+    /// ```
+    ///
+    /// The space to the right of the box forms a corral (no goals, no bare-goal
+    /// guard fires).  The fence is the single box at (2,1).  That box sits in a
+    /// closed-edge set covering cells (2,1)–(4,1) with 0 goals, so
+    /// `has_set_deadlock` returns true → `corral_prune` must return `true`.
+    #[test]
+    fn corral_prune_detects_deadlock() {
+        let level = SokobanLevel::from_xsb(
+            "#######\n#@$   #\n#######",
+        ).expect("parse");
+        let solver = Solver::new(&level);
+        assert!(
+            solver.corral_prune(level.player_pos, &level.boxes),
+            "expected deadlocked corral to be pruned",
+        );
+    }
+
+    /// Same topology but with a goal at (3,1) inside the corral — no box on it.
+    ///
+    /// ```text
+    /// #######
+    /// #@$.  #
+    /// #######
+    /// ```
+    ///
+    /// The bare-goal safety guard must fire and skip pruning this corral, so
+    /// `corral_prune` must return `false` (no false prune).
+    #[test]
+    fn corral_prune_skips_bare_goal() {
+        let level = SokobanLevel::from_xsb(
+            "#######\n#@$.  #\n#######",
+        ).expect("parse");
+        let solver = Solver::new(&level);
+        assert!(
+            !solver.corral_prune(level.player_pos, &level.boxes),
+            "expected bare-goal corral to be left unpruned",
+        );
     }
 }

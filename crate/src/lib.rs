@@ -1,4 +1,5 @@
 mod bitplane;
+mod deadlock_sets;
 mod level;
 mod solver;
 mod url;

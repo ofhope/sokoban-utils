@@ -1,7 +1,10 @@
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::cmp::Reverse;
 use wasm_bindgen::prelude::*;
 use crate::bitplane::BitPlane;
+use crate::deadlock_sets::{
+    compute_closed_edge_sets, compute_general_closed_sets, DeadlockSetRegistry,
+};
 use crate::level::SokobanLevel;
 
 // ── Public WASM types ──────────────────────────────────────────────────────
@@ -44,12 +47,10 @@ pub struct Solver {
     /// perpendicular to the push direction, not a dead square, and the next
     /// cell in the push direction is also a legal, non-dead, non-goal square.
     tunnel_data: Vec<[bool; 4]>,
-    /// Precomputed closed-edge deadlock sets (Phase 2).
-    /// Each set covers a contiguous wall-edge segment with sealed lateral ends.
-    deadlock_sets: Vec<ClosedEdgeSet>,
-    /// `set_membership[flat]` lists every set index that cell belongs to.
-    /// Used to quickly find which sets to check when a box lands on that cell.
-    set_membership: Vec<Vec<u32>>,
+    /// Unified deadlock-set registry: closed-edge, general-closed, and
+    /// (eventually) controller / freeze / diagonal-center / dynamic sets,
+    /// indexed by cell for O(memberships) overflow checks on every push.
+    deadlock_sets: DeadlockSetRegistry,
 }
 
 #[wasm_bindgen]
@@ -61,14 +62,23 @@ impl Solver {
             &level.walls, &level.goals, level.width, level.height,
         );
         let tunnel_data = compute_tunnels(&level.walls, &level.goals, &dead, level.width, level.height);
-        let (mut deadlock_sets, mut set_membership) = compute_closed_edge_sets(
+
+        // Build the unified deadlock-set registry.  Closed-edge first (fast
+        // linear scan), then general-closed (forced-expansion closures of
+        // L-/T-/irregular shapes).  Closed-edge sets are technically a subset
+        // of what general-closed finds, but we keep the linear scan because
+        // its sets are produced more cheaply and the overlap is harmless —
+        // duplicate memberships only cost one extra check per push.
+        let mut deadlock_sets = DeadlockSetRegistry::new(level.width, level.height);
+        compute_closed_edge_sets(
+            &mut deadlock_sets,
             &level.walls, &level.goals, &dead, level.width, level.height,
         );
-        // Phase 3: extend with general closed sets (L-shapes, T-shapes, etc.)
         compute_general_closed_sets(
+            &mut deadlock_sets,
             &level.walls, &level.goals, &dead, level.width, level.height,
-            &mut deadlock_sets, &mut set_membership,
         );
+
         Solver {
             width: level.width,
             height: level.height,
@@ -78,7 +88,6 @@ impl Solver {
             goal_distances,
             tunnel_data,
             deadlock_sets,
-            set_membership,
         }
     }
 
@@ -92,30 +101,7 @@ impl Solver {
     ///   - Max number of set memberships any single cell has accumulated
     ///   - Histogram of membership counts (how many cells have 0, 1, 2, … memberships)
     pub fn set_diagnostics(&self) -> String {
-        let total_sets = self.deadlock_sets.len();
-
-        let counts: Vec<usize> = self.set_membership.iter().map(|v| v.len()).collect();
-        let max_count = counts.iter().copied().max().unwrap_or(0);
-
-        // Build a histogram up to max_count (capped at 10 buckets for readability).
-        let cap = max_count.min(10);
-        let mut hist = vec![0usize; cap + 2]; // bucket cap+1 = "more than cap"
-        for &c in &counts {
-            if c <= cap { hist[c] += 1; } else { hist[cap + 1] += 1; }
-        }
-
-        let mut out = format!(
-            "deadlock sets: {}  |  max memberships per cell: {}\n  histogram (memberships → cell count):\n",
-            total_sets, max_count,
-        );
-        for (i, &n) in hist.iter().enumerate() {
-            if i == cap + 1 {
-                out.push_str(&format!("    >{}  → {}\n", cap, n));
-            } else {
-                out.push_str(&format!("    {}  → {}\n", i, n));
-            }
-        }
-        out
+        self.deadlock_sets.diagnostics()
     }
 
     /// Run A* over push states. Returns None (unsolvable or limit hit) via solved=false.
@@ -216,18 +202,6 @@ impl Solver {
 
 // ── Internal types ─────────────────────────────────────────────────────────
 
-/// A closed-edge deadlock set: a contiguous wall-edge segment whose boxes
-/// can never escape.  If `boxes_in_set > goal_count`, the position is a deadlock.
-///
-/// Corresponds to the simplest class of YASS deadlock sets — a straight
-/// wall-edge with both lateral ends sealed by walls or the level boundary.
-struct ClosedEdgeSet {
-    /// All (x, y) cells in this set (no walls, no dead squares).
-    cells: Vec<(u8, u8)>,
-    /// Number of goal cells within the set.
-    goal_count: u32,
-}
-
 #[derive(Clone, Eq, PartialEq, Hash)]
 struct State {
     boxes: BitPlane,
@@ -321,19 +295,12 @@ impl Solver {
         flat
     }
 
-    /// Check whether placing a box at `(to_x, to_y)` causes any closed-edge
-    /// set to overflow its goal capacity.
+    /// Check whether placing a box at `(to_x, to_y)` causes any registered
+    /// deadlock set to overflow its capacity.
     ///
     /// `boxes` must already include the new box at `(to_x, to_y)`.
     fn has_set_deadlock(&self, to_x: u8, to_y: u8, boxes: &BitPlane) -> bool {
-        let flat = to_y as usize * self.width as usize + to_x as usize;
-        self.set_membership[flat].iter().any(|&set_idx| {
-            let set = &self.deadlock_sets[set_idx as usize];
-            let box_count = set.cells.iter()
-                .filter(|&&(x, y)| boxes.get(x, y))
-                .count() as u32;
-            box_count > set.goal_count
-        })
+        self.deadlock_sets.has_overflow_deadlock(to_x, to_y, boxes)
     }
 
     /// Generate all valid pushes from a search state.
@@ -539,300 +506,9 @@ fn compute_tunnels(
     out
 }
 
-// ── Closed-edge deadlock sets ──────────────────────────────────────────────
-//
-// A "closed-edge" is a contiguous run of floor cells all sharing the same
-// sealed wall on one side (top / bottom / left / right), whose run endpoints
-// are also blocked by walls or the level boundary on the lateral axis.
-//
-// Because boxes on such a segment can never leave it, the maximum number of
-// boxes that can be satisfied is goal_count.  Any state with more boxes than
-// goals in the set is a deadlock.
-//
-// Dead squares act as run-breakers (boxes can never land there).
-// Sets where goal_count >= run_length are skipped (boxes can always fit).
-//
-// This is the Rust equivalent of YASS's simplest deadlock-set class.
-
-fn compute_closed_edge_sets(
-    walls: &BitPlane,
-    goals: &BitPlane,
-    dead: &BitPlane,
-    width: u8,
-    height: u8,
-) -> (Vec<ClosedEdgeSet>, Vec<Vec<u32>>) {
-    let cells_count = width as usize * height as usize;
-    let mut sets: Vec<ClosedEdgeSet> = Vec::new();
-    let mut membership: Vec<Vec<u32>> = vec![Vec::new(); cells_count];
-
-    // Horizontal scans — top-wall and bottom-wall edges.
-    for y in 0..height {
-        // Top-wall edge: each cell has wall or OOB directly above.
-        // A box there cannot be pushed up (wall) or down (player needs the wall cell).
-        {
-            let mut xs: Option<u8> = None;
-            // Iterate one past the end to flush any in-progress run.
-            for xi in 0..=(width as u16) {
-                let in_run = xi < width as u16 && {
-                    let x = xi as u8;
-                    !walls.get(x, y) && !dead.get(x, y)
-                        && (y == 0 || walls.get(x, y - 1))
-                };
-                if in_run {
-                    if xs.is_none() { xs = Some(xi as u8); }
-                } else if let Some(x_start) = xs.take() {
-                    let x_end = xi as u8 - 1;
-                    try_record_h_run(x_start, x_end, y, walls, goals, dead, width,
-                                     &mut sets, &mut membership);
-                }
-            }
-        }
-        // Bottom-wall edge: each cell has wall or OOB directly below.
-        {
-            let mut xs: Option<u8> = None;
-            for xi in 0..=(width as u16) {
-                let in_run = xi < width as u16 && {
-                    let x = xi as u8;
-                    !walls.get(x, y) && !dead.get(x, y)
-                        && (y + 1 >= height || walls.get(x, y + 1))
-                };
-                if in_run {
-                    if xs.is_none() { xs = Some(xi as u8); }
-                } else if let Some(x_start) = xs.take() {
-                    let x_end = xi as u8 - 1;
-                    try_record_h_run(x_start, x_end, y, walls, goals, dead, width,
-                                     &mut sets, &mut membership);
-                }
-            }
-        }
-    }
-
-    // Vertical scans — left-wall and right-wall edges.
-    for x in 0..width {
-        // Left-wall edge: each cell has wall or OOB directly to the left.
-        {
-            let mut ys: Option<u8> = None;
-            for yi in 0..=(height as u16) {
-                let in_run = yi < height as u16 && {
-                    let y = yi as u8;
-                    !walls.get(x, y) && !dead.get(x, y)
-                        && (x == 0 || walls.get(x - 1, y))
-                };
-                if in_run {
-                    if ys.is_none() { ys = Some(yi as u8); }
-                } else if let Some(y_start) = ys.take() {
-                    let y_end = yi as u8 - 1;
-                    try_record_v_run(x, y_start, y_end, walls, goals, dead, width, height,
-                                     &mut sets, &mut membership);
-                }
-            }
-        }
-        // Right-wall edge: each cell has wall or OOB directly to the right.
-        {
-            let mut ys: Option<u8> = None;
-            for yi in 0..=(height as u16) {
-                let in_run = yi < height as u16 && {
-                    let y = yi as u8;
-                    !walls.get(x, y) && !dead.get(x, y)
-                        && (x + 1 >= width || walls.get(x + 1, y))
-                };
-                if in_run {
-                    if ys.is_none() { ys = Some(yi as u8); }
-                } else if let Some(y_start) = ys.take() {
-                    let y_end = yi as u8 - 1;
-                    try_record_v_run(x, y_start, y_end, walls, goals, dead, width, height,
-                                     &mut sets, &mut membership);
-                }
-            }
-        }
-    }
-
-    (sets, membership)
-}
-
-/// Attempt to record a horizontal closed-edge run [xs..=xe] at row `y`.
-///
-/// The run is only recorded if it is laterally bounded (wall or OOB on both
-/// the left of `xs` and the right of `xe`) and has fewer goals than cells
-/// (otherwise the capacity can never be exceeded).
-fn try_record_h_run(
-    xs: u8, xe: u8, y: u8,
-    walls: &BitPlane,
-    goals: &BitPlane,
-    dead: &BitPlane,
-    width: u8,
-    sets: &mut Vec<ClosedEdgeSet>,
-    membership: &mut Vec<Vec<u32>>,
-) {
-    // Left bound: wall, OOB, or dead square to the left of the run start.
-    // Dead squares count as walls here — boxes are never pushed there, so a
-    // box at `xs` cannot escape left (the solver would prune that push).
-    let left_bound  = xs == 0 || walls.get(xs - 1, y) || dead.get(xs - 1, y);
-    // Right bound: same logic on the right side.
-    let right_bound = xe >= width - 1 || walls.get(xe + 1, y) || dead.get(xe + 1, y);
-    if !left_bound || !right_bound { return; }
-
-    let cells: Vec<(u8, u8)> = (xs..=xe).map(|x| (x, y)).collect();
-    let goal_count = cells.iter().filter(|&&(x, y)| goals.get(x, y)).count() as u32;
-    if goal_count >= cells.len() as u32 { return; } // can never overflow
-
-    let set_idx = sets.len() as u32;
-    for &(x, y) in &cells {
-        membership[y as usize * width as usize + x as usize].push(set_idx);
-    }
-    sets.push(ClosedEdgeSet { cells, goal_count });
-}
-
-/// Attempt to record a vertical closed-edge run [ys..=ye] at column `x`.
-fn try_record_v_run(
-    x: u8, ys: u8, ye: u8,
-    walls: &BitPlane,
-    goals: &BitPlane,
-    dead: &BitPlane,
-    width: u8,
-    height: u8,
-    sets: &mut Vec<ClosedEdgeSet>,
-    membership: &mut Vec<Vec<u32>>,
-) {
-    let top_bound = ys == 0 || walls.get(x, ys - 1) || dead.get(x, ys - 1);
-    let bot_bound = ye >= height - 1 || walls.get(x, ye + 1) || dead.get(x, ye + 1);
-    if !top_bound || !bot_bound { return; }
-
-    let cells: Vec<(u8, u8)> = (ys..=ye).map(|y| (x, y)).collect();
-    let goal_count = cells.iter().filter(|&&(x, y)| goals.get(x, y)).count() as u32;
-    if goal_count >= cells.len() as u32 { return; }
-
-    let set_idx = sets.len() as u32;
-    for &(x, y) in &cells {
-        membership[y as usize * width as usize + x as usize].push(set_idx);
-    }
-    sets.push(ClosedEdgeSet { cells, goal_count });
-}
-
-// ── General closed-set detection (Phase 3) ────────────────────────────────
-//
-// For each non-dead, non-wall floor cell (the "seed") we compute its
-// *minimum closed superset* via forced expansion: any escape route from the
-// current set S must be closed by pulling the destination cell into S.  The
-// process terminates when S is stable (truly closed) or exceeds MAX_SIZE
-// (the region is too open to be a useful constraint).
-//
-// SOUNDNESS — no false positives are possible:
-//   After expansion, for every cell p ∈ S and every direction d, the push
-//   "box at p in direction d" is either impossible (dest is OOB/wall/dead,
-//   or from is OOB/wall) or the dest is already in S.  So S is closed under
-//   *any* player position, not just the current one.  If box_count > goal_count
-//   in S, the surplus box can never reach a goal — permanent deadlock.
-//
-// COMPLETENESS — some real deadlocks are missed (acceptable):
-//   We treat the player as omnipresent (able to reach any non-wall cell).
-//   States where the player is blocked from an escape route by boxes are not
-//   detected here, but may be caught by freeze detection or corral pruning.
-//
-// Phase 3 subsumes Phase 2 (it finds all linear closed-edge runs plus L-,
-// T-, and irregular shapes) but we keep Phase 2 for the fast linear scan.
-// Duplicates between Phase 2 and Phase 3 result in redundant (but harmless)
-// membership entries; the `seen` HashSet prevents duplicates within Phase 3.
-
-/// Maximum cell count for a general closed set.
-/// Larger sets are too broad to fire often enough to be useful.
-const MAX_CLOSED_SET_SIZE: usize = 8;
-
-/// Append general closed sets to an existing `sets`/`membership` pair
-/// (built by Phase 2).  Called once per level load.
-fn compute_general_closed_sets(
-    walls: &BitPlane,
-    goals: &BitPlane,
-    dead: &BitPlane,
-    width: u8,
-    height: u8,
-    sets: &mut Vec<ClosedEdgeSet>,
-    membership: &mut Vec<Vec<u32>>,
-) {
-    // Dedup within Phase 3; Phase 2 duplicates are accepted as harmless.
-    let mut seen: HashSet<Vec<(u8, u8)>> = HashSet::new();
-
-    for y in 0..height {
-        for x in 0..width {
-            if walls.get(x, y) || dead.get(x, y) { continue; }
-
-            let Some(mut s) = find_min_closure(x, y, walls, dead, width, height) else { continue };
-
-            s.sort_unstable(); // canonical form for dedup
-
-            if seen.contains(&s) { continue; }
-
-            let goal_count = s.iter().filter(|&&(cx, cy)| goals.get(cx, cy)).count() as u32;
-
-            // Always track in `seen` even if not a deadlock set (avoids
-            // re-examining the same closure from a different seed).
-            seen.insert(s.clone());
-
-            if goal_count < s.len() as u32 {
-                let set_idx = sets.len() as u32;
-                for &(cx, cy) in &s {
-                    membership[cy as usize * width as usize + cx as usize].push(set_idx);
-                }
-                sets.push(ClosedEdgeSet { cells: s, goal_count });
-            }
-        }
-    }
-}
-
-/// Compute the minimum closed superset of `(sx, sy)` via forced expansion.
-///
-/// For every cell `p` currently in the set and every direction `d`:
-///   * `dest = p + d`   — where the box would land
-///   * `from = p - d`   — where the player must stand to make the push
-///
-/// If `dest` is a valid, box-occupiable floor cell outside the set, *and*
-/// the player could stand at `from` (not OOB, not a wall), then `dest` must
-/// be added to the set — otherwise a box at `p` could escape via this push.
-///
-/// Returns `None` when the set grows beyond `MAX_CLOSED_SET_SIZE`, meaning
-/// the region is too open to be a useful deadlock constraint.
-fn find_min_closure(
-    sx: u8, sy: u8,
-    walls: &BitPlane,
-    dead: &BitPlane,
-    width: u8, height: u8,
-) -> Option<Vec<(u8, u8)>> {
-    // Small Vec is faster than a HashSet for n ≤ MAX_CLOSED_SET_SIZE.
-    let mut cells: Vec<(u8, u8)> = vec![(sx, sy)];
-    let mut head = 0usize; // BFS frontier pointer
-
-    while head < cells.len() {
-        let (px, py) = cells[head];
-        head += 1;
-
-        for &(dx, dy) in &DIRS {
-            let dest_x = px as i8 + dx;
-            let dest_y = py as i8 + dy;
-            let from_x = px as i8 - dx;
-            let from_y = py as i8 - dy;
-
-            // Destination must be an in-bounds, box-occupiable floor cell.
-            if !in_bounds(width, height, dest_x, dest_y) { continue; }
-            let (dest_x, dest_y) = (dest_x as u8, dest_y as u8);
-            if walls.get(dest_x, dest_y) || dead.get(dest_x, dest_y) { continue; }
-
-            // Already in S — box stays inside, no escape.
-            if cells.contains(&(dest_x, dest_y)) { continue; }
-
-            // Player-from must be reachable (not OOB, not a wall).
-            // Note: players CAN stand on dead squares — dead restricts box
-            // placement only, so no `dead.get` check here.
-            if !in_bounds(width, height, from_x, from_y) { continue; }
-            if walls.get(from_x as u8, from_y as u8) { continue; }
-
-            // Forced expansion: this is an unclosed escape route; pull dest in.
-            cells.push((dest_x, dest_y));
-            if cells.len() > MAX_CLOSED_SET_SIZE { return None; }
-        }
-    }
-
-    Some(cells)
-}
+// Closed-edge and general-closed deadlock-set precomputations live in
+// `crate::deadlock_sets`.  Kept out of here so the registry, the families,
+// and (eventually) the dynamic discovery engine share one home.
 
 // ── Bipartite matching heuristic ──────────────────────────────────────────
 //

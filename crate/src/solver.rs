@@ -1,9 +1,10 @@
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::cmp::Reverse;
 use wasm_bindgen::prelude::*;
 use crate::bitplane::BitPlane;
 use crate::deadlock_sets::{
-    compute_closed_edge_sets, compute_general_closed_sets, DeadlockSetRegistry,
+    compute_closed_edge_sets, compute_general_closed_sets, DeadlockSet, DeadlockSetKind,
+    DeadlockSetRegistry,
 };
 use crate::level::SokobanLevel;
 
@@ -130,6 +131,13 @@ impl Solver {
 
         let mut nodes_explored = 0u32;
 
+        // Dynamic deadlock-set registry: starts empty, accrues sets discovered
+        // by the no-progress engine over the course of this solve call.
+        // Lives only for the duration of this `solve` invocation; v1 does not
+        // persist dynamic sets across calls.  See `try_discover_dynamic`.
+        let mut dynamic_sets =
+            DeadlockSetRegistry::new(self.width, self.height);
+
         while let Some(Reverse(node)) = heap.pop() {
             nodes_explored += 1;
             if nodes_explored > max_nodes {
@@ -156,7 +164,15 @@ impl Solver {
             }
             visited.insert(node.state.clone(), node.f);
 
+            // Track whether the popped node had any surviving push successors.
+            // A "true dead-end" — pushes were generated but all pruned — is the
+            // trigger for the dynamic deadlock-set discovery engine.
+            let mut generated_pushes = 0u32;
+            let mut surviving_pushes = 0u32;
+
             for push in self.generate_pushes(&node.state) {
+                generated_pushes += 1;
+
                 let mut new_boxes = node.state.boxes.clone();
                 new_boxes.clear(push.from_x, push.from_y);
 
@@ -172,6 +188,13 @@ impl Solver {
                 // the pushed box is not adjacent to any wall (so freeze would
                 // miss it).
                 if self.has_set_deadlock(push.to_x, push.to_y, &new_boxes) { continue; }
+
+                // Prune: dynamic deadlock-set overflow — same idea against the
+                // sets discovered by the no-progress engine earlier in this
+                // solve call.
+                if dynamic_sets.has_overflow_deadlock(push.to_x, push.to_y, &new_boxes) {
+                    continue;
+                }
 
                 // Prune: freeze deadlock (biaxial chain detection)
                 if is_freeze_deadlock(push.to_x, push.to_y, &new_boxes, &self.walls, &self.goals, &self.dead) {
@@ -192,7 +215,17 @@ impl Solver {
                 let mut new_path = node.path.clone();
                 new_path.push(push);
 
+                surviving_pushes += 1;
                 heap.push(Reverse(Node { f: g + h, cost: g, state: new_state, path: new_path }));
+            }
+
+            // Dead-end trigger: the node had legal pushes available but every
+            // single one was pruned.  This is YASS's `TTAddNoPushesDeadlock`
+            // entry condition.  Hand the state to the dynamic engine; if it
+            // can prove the configuration is permanently stuck, the resulting
+            // deadlock set goes into `dynamic_sets` and prunes future paths.
+            if generated_pushes > 0 && surviving_pushes == 0 {
+                self.try_discover_dynamic(&node.state, &mut dynamic_sets);
             }
         }
 
@@ -353,6 +386,127 @@ impl Solver {
             }
         }
         pushes
+    }
+
+    // ── Dynamic deadlock-set discovery ─────────────────────────────────────
+    //
+    // YASS's `TTAddNoPushesDeadlock` (YASS.pas:16550) is triggered when the
+    // forward search reaches a node with no legal pushes.  YASS then runs the
+    // multi-mode `CheckDeadlockSetCandidate` (YASS.pas:8859) — a depth-bounded
+    // proof using pushes, pulls, and the "paint the player into a corner"
+    // variant — to verify the candidate is a sound deadlock before committing
+    // it via `CommitDeadlockSet` (YASS.pas:8752).
+    //
+    // The faithful port is well over a thousand lines.  This v1 implements
+    // the same SOUND subset: a forward BFS from the dead-end state, bounded
+    // in depth and total explored states, that prunes successors using the
+    // existing static-set / freeze / corral machinery.  If the BFS exhausts
+    // without reaching any non-pruned (potentially solvable) state, every
+    // forward-reachable state from the candidate is a known deadlock, so the
+    // candidate itself is a deadlock and we commit it.
+    //
+    // The committed set contains every cell currently holding a box, with
+    // capacity = box_count - 1.  Future states with the same box pattern get
+    // pruned by the existing `has_overflow_deadlock` query — no new A* hot
+    // path is required.
+
+    /// Maximum reverse/forward search depth — matches YASS's
+    /// `MAX_DEADLOCK_SEARCH_DEPTH` (YASS.pas:417).  Deeper proofs would risk
+    /// blowing up the per-discovery cost without proportionate benefit.
+    const DEADLOCK_SEARCH_DEPTH: u32 = 24;
+
+    /// Hard cap on states explored per discovery call.  YASS has no direct
+    /// equivalent — its discovery uses a fixed-size transposition table — but
+    /// we need a cap so a pathological branching factor cannot stall A* in a
+    /// single mega-discovery.
+    const DEADLOCK_SEARCH_NODES: u32 = 2_048;
+
+    fn try_discover_dynamic(
+        &self,
+        state: &State,
+        dynamic: &mut DeadlockSetRegistry,
+    ) {
+        // The dead-end trigger fires when no push survives the prune chain.
+        // We re-prove that here from scratch using a forward BFS so the
+        // soundness argument doesn't lean on the calling context — only on
+        // the same prune predicates the main A* loop uses.
+
+        let mut seen: HashSet<State> = HashSet::new();
+        let mut queue: VecDeque<(State, u32)> = VecDeque::new();
+        let mut nodes = 0u32;
+
+        seen.insert(state.clone());
+        queue.push_back((state.clone(), 0));
+
+        while let Some((s, depth)) = queue.pop_front() {
+            nodes += 1;
+            if nodes > Self::DEADLOCK_SEARCH_NODES {
+                // Budget exhausted — abort without committing.
+                return;
+            }
+
+            // If any reachable state is solved, the candidate is NOT a deadlock.
+            if self.is_solved(&s.boxes) {
+                return;
+            }
+
+            if depth >= Self::DEADLOCK_SEARCH_DEPTH {
+                // Depth bound hit before exhausting the frontier — we cannot
+                // soundly conclude every reachable state is stuck, so abort.
+                return;
+            }
+
+            for push in self.generate_pushes(&s) {
+                let mut new_boxes = s.boxes.clone();
+                new_boxes.clear(push.from_x, push.from_y);
+
+                // Apply every prune the main A* loop uses.  States the
+                // existing machinery already classifies as stuck do not need
+                // to be expanded — they're leaves in the unsolvable region.
+                if self.dead.get(push.to_x, push.to_y) { continue; }
+                new_boxes.set(push.to_x, push.to_y);
+                if self.has_set_deadlock(push.to_x, push.to_y, &new_boxes) { continue; }
+                if dynamic.has_overflow_deadlock(push.to_x, push.to_y, &new_boxes) { continue; }
+                if is_freeze_deadlock(
+                    push.to_x, push.to_y, &new_boxes,
+                    &self.walls, &self.goals, &self.dead,
+                ) { continue; }
+
+                // Intentionally NOT calling corral_prune here.  Corral
+                // pruning is expensive and itself recurses into has_set /
+                // freeze checks; using it inside discovery would multiply
+                // the per-state cost without strengthening the proof.
+
+                let new_player = self.normalise_player(
+                    push.from_flat as u16, &new_boxes,
+                );
+                let next = State { boxes: new_boxes, player_norm: new_player };
+
+                if seen.insert(next.clone()) {
+                    queue.push_back((next, depth + 1));
+                }
+            }
+        }
+
+        // Frontier exhausted within bounds — every forward-reachable state
+        // is a known deadlock.  Commit the candidate.
+
+        let cells: Vec<(u8, u8)> = state.boxes.iter_set_bits().collect();
+        let n = cells.len() as u32;
+        if n == 0 { return; }
+        let goal_count = cells.iter()
+            .filter(|&&(x, y)| self.goals.get(x, y))
+            .count() as u32;
+
+        dynamic.add(DeadlockSet {
+            cells,
+            goal_count,
+            // Capacity = n - 1 fires only when all n cells are simultaneously
+            // occupied.  That's exactly the memo we proved.  See the
+            // discussion in `DeadlockSet::capacity`.
+            capacity: n.saturating_sub(1),
+            kind: DeadlockSetKind::Dynamic,
+        });
     }
 }
 

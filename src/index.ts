@@ -102,6 +102,14 @@ export function fromBase64Url(str: string): Uint8Array {
 export interface SolveOptions {
   /** Maximum push-states to explore before giving up. Default: 500_000 */
   maxNodes?: number;
+  /**
+   * Let the solver discover deadlock sets while searching. Default: false.
+   *
+   * It is sound, but currently costs far more than it saves: across the
+   * 100-puzzle sample it changed no outcome and no push count while taking
+   * 7.5x as long. Turn it on only when experimenting with that engine.
+   */
+  dynamicDeadlocks?: boolean;
 }
 
 export interface SolveResult {
@@ -133,6 +141,7 @@ export interface SolveResult {
  */
 export function solveLevel(level: SokobanLevel, options?: SolveOptions): SolveResult {
   const solver = Solver.new(level);
+  solver.set_dynamic_deadlocks(options?.dynamicDeadlocks ?? false);
   const result = solver.solve(level, options?.maxNodes ?? 500_000);
   return {
     solved: result.solved(),

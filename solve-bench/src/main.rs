@@ -14,6 +14,11 @@
 //!     --levels  ../normalised-levels.xsb \
 //!     --output  solver-results.csv       \
 //!     --max-nodes 500000
+//!
+//! # Dynamic deadlock discovery
+//!
+//! Off unless `--dynamic-deadlocks` is passed.  See `Solver::set_dynamic_deadlocks`
+//! for why: on sample-100.xsb it changed no outcome while costing 7.5x the runtime.
 //! ```
 //!
 //! # How the parallelism works
@@ -46,6 +51,7 @@ use sokoban_utils::{Solver, SokobanLevel};
 
 struct Args {
     levels:    PathBuf,
+    dynamic_deadlocks: bool,
     output:    PathBuf,
     max_nodes: u32,
 }
@@ -56,11 +62,13 @@ impl Args {
         let mut levels    = PathBuf::from("../sample-10.xsb");
         let mut output    = PathBuf::from("solver-results.csv");
         let mut max_nodes = 500_000u32;
+        let mut dynamic_deadlocks = false;
 
         while let Some(flag) = args.next() {
             match flag.as_str() {
                 "--levels"    => levels    = args.next().ok_or("--levels needs a value")?.into(),
                 "--output"    => output    = args.next().ok_or("--output needs a value")?.into(),
+                "--dynamic-deadlocks" => dynamic_deadlocks = true,
                 "--max-nodes" => max_nodes = args.next()
                                     .ok_or("--max-nodes needs a value")?
                                     .parse()
@@ -68,7 +76,7 @@ impl Args {
                 other => return Err(format!("Unknown flag: {other}")),
             }
         }
-        Ok(Args { levels, output, max_nodes })
+        Ok(Args { levels, output, max_nodes, dynamic_deadlocks })
     }
 }
 
@@ -139,7 +147,11 @@ struct SolveResult {
     moves:      String,
 }
 
-fn solve_puzzle(puzzle: &Puzzle, max_nodes: u32) -> Result<SolveResult, String> {
+fn solve_puzzle(
+    puzzle: &Puzzle,
+    max_nodes: u32,
+    dynamic_deadlocks: bool,
+) -> Result<SolveResult, String> {
     // Parse the XSB grid into a SokobanLevel.
     // from_xsb returns Result<SokobanLevel, JsValue>; on native targets JsValue
     // is a wasm_bindgen shim — map its error to a plain String.
@@ -147,7 +159,8 @@ fn solve_puzzle(puzzle: &Puzzle, max_nodes: u32) -> Result<SolveResult, String> 
         .map_err(|e| format!("{e:?}"))?;
 
     // Build the solver (runs dead-square / goal-distance precomputation).
-    let solver = Solver::new(&level);
+    let mut solver = Solver::new(&level);
+    solver.set_dynamic_deadlocks(dynamic_deadlocks);
 
     // Run A* up to max_nodes expanded states.
     let result = solver.solve(&level, max_nodes);
@@ -226,7 +239,12 @@ fn main() {
     // Solve all puzzles in parallel.
     // Rayon distributes work across a thread pool sized to the number of
     // logical CPUs.  Each closure is independent — no shared mutable state.
-    println!("Solving {} puzzles in parallel (max_nodes={})…", puzzles.len(), args.max_nodes);
+    println!(
+        "Solving {} puzzles in parallel (max_nodes={}, dynamic deadlocks {})…",
+        puzzles.len(),
+        args.max_nodes,
+        if args.dynamic_deadlocks { "on" } else { "off" },
+    );
     let t0 = Instant::now();
 
     // Progress reporting: puzzles finish out of order and a hard one can run for
@@ -239,7 +257,7 @@ fn main() {
     let results: Vec<(&Puzzle, Result<SolveResult, String>)> = puzzles
         .par_iter()
         .map(|puzzle| {
-            let result = solve_puzzle(puzzle, args.max_nodes);
+            let result = solve_puzzle(puzzle, args.max_nodes, args.dynamic_deadlocks);
             if result.as_ref().map(|r| r.solved).unwrap_or(false) {
                 solved_live.fetch_add(1, Ordering::Relaxed);
             }

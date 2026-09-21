@@ -52,6 +52,9 @@ pub struct Solver {
     /// (eventually) controller / freeze / diagonal-center / dynamic sets,
     /// indexed by cell for O(memberships) overflow checks on every push.
     deadlock_sets: DeadlockSetRegistry,
+    /// Whether the no-progress engine may discover deadlock sets during a
+    /// solve.  Off by default — see `set_dynamic_deadlocks`.
+    dynamic_deadlocks: bool,
 }
 
 #[wasm_bindgen]
@@ -89,7 +92,28 @@ impl Solver {
             goal_distances,
             tunnel_data,
             deadlock_sets,
+            // Off by default: measured over sample-100.xsb at max_nodes=500_000,
+            // enabling it changed nothing about the outcome — same 82 solved,
+            // identical push counts — while taking 1542s instead of 205s.
+            // On the hardest solved puzzle it accounted for 88% of runtime and
+            // 1.2% of the nodes searched: 2_486 proofs bought 1_724 prunes.
+            // The economics only work once a committed set is shrunk to the
+            // minimal stuck subset (YASS does this) instead of naming every box
+            // on the board, because a set listing all boxes practically never
+            // matches a later position.
+            dynamic_deadlocks: false,
         }
+    }
+
+    /// Enable or disable dynamic deadlock-set discovery for this solver.
+    ///
+    /// When on, a node whose pushes are all pruned is handed to the
+    /// no-progress engine, which tries to prove the configuration permanently
+    /// stuck and commits a deadlock set that prunes later positions.  It is
+    /// sound but currently expensive relative to what it saves, so it is off
+    /// unless you turn it on.
+    pub fn set_dynamic_deadlocks(&mut self, on: bool) {
+        self.dynamic_deadlocks = on;
     }
 
     /// Return a human-readable diagnostic string about the precomputed deadlock sets.
@@ -224,7 +248,7 @@ impl Solver {
             // entry condition.  Hand the state to the dynamic engine; if it
             // can prove the configuration is permanently stuck, the resulting
             // deadlock set goes into `dynamic_sets` and prunes future paths.
-            if generated_pushes > 0 && surviving_pushes == 0 {
+            if self.dynamic_deadlocks && generated_pushes > 0 && surviving_pushes == 0 {
                 self.try_discover_dynamic(&node.state, &mut dynamic_sets);
             }
         }

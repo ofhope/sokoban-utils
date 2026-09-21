@@ -1,6 +1,6 @@
 {
   "name": "@thequirkyfox/sokoban-utils",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Sokoban bitplane codec, solver, and URL encoder — compiled from Rust to WASM",
   "type": "module",
   "main": "./dist/index.js",

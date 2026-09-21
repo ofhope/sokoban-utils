@@ -426,10 +426,62 @@ impl Solver {
         state: &State,
         dynamic: &mut DeadlockSetRegistry,
     ) {
-        // The dead-end trigger fires when no push survives the prune chain.
-        // We re-prove that here from scratch using a forward BFS so the
-        // soundness argument doesn't lean on the calling context — only on
-        // the same prune predicates the main A* loop uses.
+        // The committed set is keyed on box cells alone, so it will prune
+        // future states whatever the player's position.  That is only sound if
+        // the configuration is stuck from *every* region the player could be
+        // in — a layout that traps the player on one side can still be live
+        // from the other.  Prove each region separately and commit only if all
+        // of them are stuck.
+        for player_norm in self.player_regions(&state.boxes) {
+            let candidate = State { boxes: state.boxes.clone(), player_norm };
+            if !self.prove_stuck(&candidate, dynamic) { return; }
+        }
+
+        let cells: Vec<(u8, u8)> = state.boxes.iter_set_bits().collect();
+        let n = cells.len() as u32;
+        if n == 0 { return; }
+        let goal_count = cells.iter()
+            .filter(|&&(x, y)| self.goals.get(x, y))
+            .count() as u32;
+
+        dynamic.add(DeadlockSet {
+            cells,
+            goal_count,
+            // Capacity = n - 1 fires only when all n cells are simultaneously
+            // occupied.  That's exactly the memo we proved.  See the
+            // discussion in `DeadlockSet::capacity`.
+            capacity: n.saturating_sub(1),
+            kind: DeadlockSetKind::Dynamic,
+        });
+    }
+
+    /// One normalised player position per connected free region, given `boxes`.
+    fn player_regions(&self, boxes: &BitPlane) -> Vec<u16> {
+        let mut seen = BitPlane::new(self.width, self.height);
+        let mut out = Vec::new();
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.walls.get(x, y) || boxes.get(x, y) || seen.get(x, y) { continue; }
+                let region = flood_fill(x, y, &self.walls, boxes, self.width, self.height);
+                let cells: Vec<(u8, u8)> = region.iter_set_bits().collect();
+                for &(rx, ry) in &cells { seen.set(rx, ry); }
+                if let Some(&(nx, ny)) = cells.first() {
+                    out.push(ny as u16 * self.width as u16 + nx as u16);
+                }
+            }
+        }
+        out
+    }
+
+    /// Forward BFS from `state`: true when every reachable state is already a
+    /// known deadlock, i.e. the configuration is provably stuck.  Returns false
+    /// if a solved state is reachable, or if the depth/node budget runs out
+    /// before the frontier is exhausted — an unfinished search proves nothing.
+    fn prove_stuck(
+        &self,
+        state: &State,
+        dynamic: &DeadlockSetRegistry,
+    ) -> bool {
 
         let mut seen: HashSet<State> = HashSet::new();
         let mut queue: VecDeque<(State, u32)> = VecDeque::new();
@@ -441,19 +493,19 @@ impl Solver {
         while let Some((s, depth)) = queue.pop_front() {
             nodes += 1;
             if nodes > Self::DEADLOCK_SEARCH_NODES {
-                // Budget exhausted — abort without committing.
-                return;
+                // Budget exhausted — proves nothing.
+                return false;
             }
 
             // If any reachable state is solved, the candidate is NOT a deadlock.
             if self.is_solved(&s.boxes) {
-                return;
+                return false;
             }
 
             if depth >= Self::DEADLOCK_SEARCH_DEPTH {
                 // Depth bound hit before exhausting the frontier — we cannot
                 // soundly conclude every reachable state is stuck, so abort.
-                return;
+                return false;
             }
 
             for push in self.generate_pushes(&s) {
@@ -489,24 +541,8 @@ impl Solver {
         }
 
         // Frontier exhausted within bounds — every forward-reachable state
-        // is a known deadlock.  Commit the candidate.
-
-        let cells: Vec<(u8, u8)> = state.boxes.iter_set_bits().collect();
-        let n = cells.len() as u32;
-        if n == 0 { return; }
-        let goal_count = cells.iter()
-            .filter(|&&(x, y)| self.goals.get(x, y))
-            .count() as u32;
-
-        dynamic.add(DeadlockSet {
-            cells,
-            goal_count,
-            // Capacity = n - 1 fires only when all n cells are simultaneously
-            // occupied.  That's exactly the memo we proved.  See the
-            // discussion in `DeadlockSet::capacity`.
-            capacity: n.saturating_sub(1),
-            kind: DeadlockSetKind::Dynamic,
-        });
+        // from here is a known deadlock.
+        true
     }
 }
 
@@ -540,54 +576,49 @@ fn flood_fill(
 // ── Dead square precomputation ─────────────────────────────────────────────
 
 fn compute_dead_squares(walls: &BitPlane, goals: &BitPlane, width: u8, height: u8) -> BitPlane {
-    let mut dead = BitPlane::new(width, height);
+    // A square is *live* when a box standing on it can still reach some goal.
+    // Compute that the way YASS does ("calculate by pulling boxes away from
+    // goal squares", YASS.pas:7448): start a box on each goal and pull it
+    // backwards in every direction.  A pull from `cell` in direction `d` moves
+    // the box to `cell + d` with the player standing on `cell + 2d`, so both of
+    // those squares must be free.  Whatever the pulls cannot reach is dead.
+    let mut live = BitPlane::new(width, height);
+    let mut queue: VecDeque<(u8, u8)> = VecDeque::new();
 
     for y in 0..height {
         for x in 0..width {
-            if walls.get(x, y) || goals.get(x, y) { continue; }
-            let blocked_h = (x == 0 || walls.get(x - 1, y)) || (x + 1 >= width || walls.get(x + 1, y));
-            let blocked_v = (y == 0 || walls.get(x, y - 1)) || (y + 1 >= height || walls.get(x, y + 1));
-            if blocked_h && blocked_v {
+            if goals.get(x, y) && !walls.get(x, y) {
+                live.set(x, y);
+                queue.push_back((x, y));
+            }
+        }
+    }
+
+    while let Some((x, y)) = queue.pop_front() {
+        for (dx, dy) in DIRS {
+            let bx = x as i16 + dx as i16;          // where the box ends up
+            let by = y as i16 + dy as i16;
+            let px = bx + dx as i16;                // where the player must stand
+            let py = by + dy as i16;
+            if bx < 0 || by < 0 || px < 0 || py < 0 { continue; }
+            if bx >= width as i16 || by >= height as i16
+                || px >= width as i16 || py >= height as i16 { continue; }
+            let (bx, by, px, py) = (bx as u8, by as u8, px as u8, py as u8);
+            if walls.get(bx, by) || walls.get(px, py) { continue; }
+            if live.get(bx, by) { continue; }
+            live.set(bx, by);
+            queue.push_back((bx, by));
+        }
+    }
+
+    let mut dead = BitPlane::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            if !walls.get(x, y) && !live.get(x, y) {
                 dead.set(x, y);
             }
         }
     }
-
-    // Propagate: a cell next to a dead cell along a wall is also dead.
-    loop {
-        let mut changed = false;
-        for y in 0..height {
-            for x in 0..width {
-                if walls.get(x, y) || goals.get(x, y) || dead.get(x, y) { continue; }
-                // Horizontal dead propagation along a horizontal wall
-                for dx in [-1i8, 1] {
-                    let nx = x as i8 + dx;
-                    if nx < 0 || nx >= width as i8 { continue; }
-                    if dead.get(nx as u8, y)
-                        && (y == 0 || walls.get(x, y - 1))
-                        && (y + 1 >= height || walls.get(x, y + 1))
-                    {
-                        dead.set(x, y);
-                        changed = true;
-                    }
-                }
-                // Vertical dead propagation along a vertical wall
-                for dy in [-1i8, 1] {
-                    let ny = y as i8 + dy;
-                    if ny < 0 || ny >= height as i8 { continue; }
-                    if dead.get(x, ny as u8)
-                        && (x == 0 || walls.get(x - 1, y))
-                        && (x + 1 >= width || walls.get(x + 1, y))
-                    {
-                        dead.set(x, y);
-                        changed = true;
-                    }
-                }
-            }
-        }
-        if !changed { break; }
-    }
-
     dead
 }
 
@@ -651,7 +682,25 @@ fn compute_tunnels(
                 let p1_wall = !in_bounds(width, height, p1x, p1y)
                     || walls.get(p1x as u8, p1y as u8);
 
-                if p0_wall && p1_wall {
+                // YASS's CalculateTunnelSquares (YASS.pas:3509) tests the
+                // perpendicular walls on the square the box is pushed FROM, not
+                // only on the square it lands on.  Without that, a box entering
+                // a corridor is forced straight through it, which loses any
+                // solution that parks a box at the corridor mouth and later
+                // pushes it back out the way it came.
+                let sx = x as i8 - dx;
+                let sy = y as i8 - dy;
+                let src_blocked = if in_bounds(width, height, sx, sy) {
+                    let q0_wall = !in_bounds(width, height, sx + pdx0, sy + pdy0)
+                        || walls.get((sx + pdx0) as u8, (sy + pdy0) as u8);
+                    let q1_wall = !in_bounds(width, height, sx + pdx1, sy + pdy1)
+                        || walls.get((sx + pdx1) as u8, (sy + pdy1) as u8);
+                    q0_wall && q1_wall
+                } else {
+                    true
+                };
+
+                if p0_wall && p1_wall && src_blocked {
                     out[flat][dir_idx] = true;
                 }
             }
@@ -805,11 +854,14 @@ fn precompute_goal_distances(
         while let Some((x, y)) = queue.pop_front() {
             let d = dist[y as usize * width as usize + x as usize];
             for (dx, dy) in DIRS {
-                // Reverse push: box was at adjacent cell, player was opposite
+                // Reverse push (pull): the box sat at (bx, by) and was pushed to
+                // (x, y).  For that push the player stood one square further
+                // back again, at (bx + dx, by + dy) — NOT on the far side of
+                // (x, y), which is where this used to look.
                 let bx = x as i8 + dx;
                 let by = y as i8 + dy;
-                let px = x as i8 - dx;
-                let py = y as i8 - dy;
+                let px = bx + dx;
+                let py = by + dy;
                 if !in_bounds(width, height, bx, by) { continue; }
                 if !in_bounds(width, height, px, py) { continue; }
                 let (bx, by) = (bx as u8, by as u8);

@@ -1,4 +1,5 @@
 mod bitplane;
+mod fxhash;
 mod deadlock_sets;
 mod level;
 mod solver;

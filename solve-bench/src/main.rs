@@ -52,6 +52,8 @@ use sokoban_utils::{Solver, SokobanLevel};
 struct Args {
     levels:    PathBuf,
     dynamic_deadlocks: bool,
+    max_seconds: u32,
+    weight: f32,
     output:    PathBuf,
     max_nodes: u32,
 }
@@ -63,12 +65,22 @@ impl Args {
         let mut output    = PathBuf::from("solver-results.csv");
         let mut max_nodes = 500_000u32;
         let mut dynamic_deadlocks = false;
+        let mut max_seconds = 0u32;
+        let mut weight = 1.0f32;
 
         while let Some(flag) = args.next() {
             match flag.as_str() {
                 "--levels"    => levels    = args.next().ok_or("--levels needs a value")?.into(),
                 "--output"    => output    = args.next().ok_or("--output needs a value")?.into(),
                 "--dynamic-deadlocks" => dynamic_deadlocks = true,
+                "--weight" => weight = args.next()
+                                    .ok_or("--weight needs a value")?
+                                    .parse()
+                                    .map_err(|_| "--weight must be a number, e.g. 2 or 1.5")?,
+                "--max-seconds" => max_seconds = args.next()
+                                    .ok_or("--max-seconds needs a value")?
+                                    .parse()
+                                    .map_err(|_| "--max-seconds must be a u32")?,
                 "--max-nodes" => max_nodes = args.next()
                                     .ok_or("--max-nodes needs a value")?
                                     .parse()
@@ -76,7 +88,7 @@ impl Args {
                 other => return Err(format!("Unknown flag: {other}")),
             }
         }
-        Ok(Args { levels, output, max_nodes, dynamic_deadlocks })
+        Ok(Args { levels, output, max_nodes, dynamic_deadlocks, max_seconds, weight })
     }
 }
 
@@ -151,6 +163,8 @@ fn solve_puzzle(
     puzzle: &Puzzle,
     max_nodes: u32,
     dynamic_deadlocks: bool,
+    max_seconds: u32,
+    weight: f32,
 ) -> Result<SolveResult, String> {
     // Parse the XSB grid into a SokobanLevel.
     // from_xsb returns Result<SokobanLevel, JsValue>; on native targets JsValue
@@ -161,6 +175,8 @@ fn solve_puzzle(
     // Build the solver (runs dead-square / goal-distance precomputation).
     let mut solver = Solver::new(&level);
     solver.set_dynamic_deadlocks(dynamic_deadlocks);
+    solver.set_time_limit_ms(max_seconds.saturating_mul(1_000));
+    solver.set_weight_percent((weight * 100.0).round() as u32);
 
     // Run A* up to max_nodes expanded states.
     let result = solver.solve(&level, max_nodes);
@@ -240,9 +256,11 @@ fn main() {
     // Rayon distributes work across a thread pool sized to the number of
     // logical CPUs.  Each closure is independent — no shared mutable state.
     println!(
-        "Solving {} puzzles in parallel (max_nodes={}, dynamic deadlocks {})…",
+        "Solving {} puzzles in parallel (max_nodes={}{}, weight={}, dynamic deadlocks {})…",
         puzzles.len(),
         args.max_nodes,
+        if args.max_seconds > 0 { format!(", max_seconds={}", args.max_seconds) } else { String::new() },
+        args.weight,
         if args.dynamic_deadlocks { "on" } else { "off" },
     );
     let t0 = Instant::now();
@@ -257,7 +275,9 @@ fn main() {
     let results: Vec<(&Puzzle, Result<SolveResult, String>)> = puzzles
         .par_iter()
         .map(|puzzle| {
-            let result = solve_puzzle(puzzle, args.max_nodes, args.dynamic_deadlocks);
+            let result = solve_puzzle(
+                puzzle, args.max_nodes, args.dynamic_deadlocks, args.max_seconds, args.weight,
+            );
             if result.as_ref().map(|r| r.solved).unwrap_or(false) {
                 solved_live.fetch_add(1, Ordering::Relaxed);
             }
@@ -280,7 +300,7 @@ fn main() {
 
     println!("  Done in {:.2?}", elapsed);
     println!(
-        "  {} solved  /  {} unsolved (node limit)  /  {} error",
+        "  {} solved  /  {} unsolved (hit limit)  /  {} error",
         solved, unsolved, errored
     );
 

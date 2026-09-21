@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, VecDeque};
 use std::cmp::Reverse;
 use wasm_bindgen::prelude::*;
 use crate::bitplane::BitPlane;
@@ -6,6 +6,7 @@ use crate::deadlock_sets::{
     compute_closed_edge_sets, compute_general_closed_sets, DeadlockSet, DeadlockSetKind,
     DeadlockSetRegistry,
 };
+use crate::fxhash::{FxHashMap, FxHashSet};
 use crate::level::SokobanLevel;
 
 // ── Public WASM types ──────────────────────────────────────────────────────
@@ -55,6 +56,11 @@ pub struct Solver {
     /// Whether the no-progress engine may discover deadlock sets during a
     /// solve.  Off by default — see `set_dynamic_deadlocks`.
     dynamic_deadlocks: bool,
+    /// Wall-clock budget in milliseconds; 0 means no limit.  Ignored on wasm,
+    /// which has no `Instant` — see `set_time_limit_ms`.
+    time_limit_ms: u32,
+    /// Heuristic weight as a percentage; 100 = plain A*.  See `set_weight_percent`.
+    weight_percent: u32,
 }
 
 #[wasm_bindgen]
@@ -102,7 +108,33 @@ impl Solver {
             // on the board, because a set listing all boxes practically never
             // matches a later position.
             dynamic_deadlocks: false,
+            time_limit_ms: 0,
+            weight_percent: 100,
         }
+    }
+
+    /// Weight the heuristic: `f = g + h * percent / 100`.
+    ///
+    /// 100 is plain A* and returns a minimum-push solution.  Above 100 the
+    /// search leans on the heuristic, exploring far fewer nodes but returning
+    /// longer solutions — the usual trade when the goal is *a* solution to a
+    /// many-box level rather than the shortest one.  Values below 100 only
+    /// slow the search down and are clamped away.
+    pub fn set_weight_percent(&mut self, percent: u32) {
+        self.weight_percent = percent.max(100);
+    }
+
+    /// Stop the search after `ms` milliseconds (0 = no limit).
+    ///
+    /// `max_nodes` bounds the number of states expanded, which is a poor proxy
+    /// for effort once per-node cost varies between levels.  A time budget
+    /// spends the same effort everywhere, so a faster solver turns directly
+    /// into deeper searches.
+    ///
+    /// Native targets only: wasm has no monotonic clock here, so the limit is
+    /// ignored there and `max_nodes` remains the bound.
+    pub fn set_time_limit_ms(&mut self, ms: u32) {
+        self.time_limit_ms = ms;
     }
 
     /// Enable or disable dynamic deadlock-set discovery for this solver.
@@ -142,9 +174,9 @@ impl Solver {
             return SolverResult { solved: true, push_count: 0, pushes: vec![], moves: String::new() };
         }
 
-        let mut visited: HashMap<State, u32> = HashMap::new();
+        let mut visited: FxHashMap<State, u32> = FxHashMap::default();
         let mut heap: BinaryHeap<Reverse<Node>> = BinaryHeap::new();
-        let h0 = self.heuristic(&initial_state.boxes);
+        let h0 = self.weigh(self.heuristic(&initial_state.boxes));
 
         heap.push(Reverse(Node {
             f: h0,
@@ -155,6 +187,14 @@ impl Solver {
 
         let mut nodes_explored = 0u32;
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let deadline = if self.time_limit_ms > 0 {
+            Some(std::time::Instant::now()
+                + std::time::Duration::from_millis(self.time_limit_ms as u64))
+        } else {
+            None
+        };
+
         // Dynamic deadlock-set registry: starts empty, accrues sets discovered
         // by the no-progress engine over the course of this solve call.
         // Lives only for the duration of this `solve` invocation; v1 does not
@@ -162,10 +202,24 @@ impl Solver {
         let mut dynamic_sets =
             DeadlockSetRegistry::new(self.width, self.height);
 
+        // Reused across every state: one labelling for the node being expanded,
+        // one for the successor under test. Both keep their allocations.
+        let cells = self.width as usize * self.height as usize;
+        let mut node_regions = RegionMap::new(cells);
+        let mut next_regions = RegionMap::new(cells);
+
         while let Some(Reverse(node)) = heap.pop() {
             nodes_explored += 1;
             if nodes_explored > max_nodes {
                 break;
+            }
+            // Checked periodically: reading the clock every node would show up
+            // in the profile at these node rates.
+            #[cfg(not(target_arch = "wasm32"))]
+            if nodes_explored % 1024 == 0 {
+                if let Some(d) = deadline {
+                    if std::time::Instant::now() >= d { break; }
+                }
             }
 
             if self.is_solved(&node.state.boxes) {
@@ -194,7 +248,9 @@ impl Solver {
             let mut generated_pushes = 0u32;
             let mut surviving_pushes = 0u32;
 
-            for push in self.generate_pushes(&node.state) {
+            node_regions.build(&self.walls, &self.goals, &node.state.boxes, self.width, self.height);
+
+            for push in self.generate_pushes(&node.state, &node_regions) {
                 generated_pushes += 1;
 
                 let mut new_boxes = node.state.boxes.clone();
@@ -225,17 +281,19 @@ impl Solver {
                     continue;
                 }
 
+                // One labelling of the successor serves the corral check and
+                // the player normalisation below.
+                next_regions.build(&self.walls, &self.goals, &new_boxes, self.width, self.height);
+
                 // Prune: corral with deadlocked fence box.
                 // Pass the player's position after the push (= old box cell).
-                if self.corral_prune(push.from_flat as u16, &new_boxes) { continue; }
+                if self.corral_prune_in(push.from_flat as u16, &new_boxes, &next_regions) { continue; }
 
-                let new_player_norm = self.normalise_player(
-                    push.from_flat as u16, &new_boxes,
-                );
+                let new_player_norm = next_regions.rep_of(push.from_flat as u16);
 
                 let new_state = State { boxes: new_boxes, player_norm: new_player_norm };
                 let g = node.cost + push.steps;
-                let h = self.heuristic(&new_state.boxes);
+                let h = self.weigh(self.heuristic(&new_state.boxes));
                 let mut new_path = node.path.clone();
                 new_path.push(push);
 
@@ -301,6 +359,14 @@ impl PartialOrd for Node {
 
 const DIRS: [(i8, i8); 4] = [(0, -1), (0, 1), (-1, 0), (1, 0)];
 
+/// For DIRS[i], the two unit vectors perpendicular to it.
+const PERPS: [[(i8, i8); 2]; 4] = [
+    [(-1, 0), (1, 0)], // up    → left and right
+    [(-1, 0), (1, 0)], // down  → left and right
+    [(0, -1), (0, 1)], // left  → up and down
+    [(0, -1), (0, 1)], // right → up and down
+];
+
 fn in_bounds(width: u8, height: u8, x: i8, y: i8) -> bool {
     x >= 0 && y >= 0 && (x as u8) < width && (y as u8) < height
 }
@@ -339,6 +405,14 @@ impl Solver {
         })
     }
 
+    /// Apply the heuristic weight, saturating rather than wrapping on the
+    /// `u32::MAX`-ish values an unreachable box produces.
+    #[inline]
+    fn weigh(&self, h: u32) -> u32 {
+        if self.weight_percent == 100 { return h; }
+        ((h as u64 * self.weight_percent as u64) / 100).min(u32::MAX as u64) as u32
+    }
+
     /// Normalise player position to the top-left-most reachable cell.
     fn normalise_player(&self, player_pos: u16, boxes: &BitPlane) -> u16 {
         let px = (player_pos as usize % self.width as usize) as u8;
@@ -365,10 +439,8 @@ impl Solver {
     /// tunnel as a single macro-push (the box passes through intermediate
     /// squares without stopping).  This reduces the branching factor on
     /// corridor-heavy levels without affecting correctness.
-    fn generate_pushes(&self, state: &State) -> Vec<Push> {
-        let px = (state.player_norm as usize % self.width as usize) as u8;
-        let py = (state.player_norm as usize / self.width as usize) as u8;
-        let reachable = flood_fill(px, py, &self.walls, &state.boxes, self.width, self.height);
+    fn generate_pushes(&self, state: &State, regions: &RegionMap) -> Vec<Push> {
+        let player_region = regions.region_of(state.player_norm);
         let mut pushes = Vec::new();
 
         for (bx, by) in state.boxes.iter_set_bits() {
@@ -384,7 +456,8 @@ impl Solver {
                 let (pfx, pfy) = (push_from_x as u8, push_from_y as u8);
                 let (mut ptx, mut pty) = (push_to_x as u8, push_to_y as u8);
 
-                if !reachable.get(pfx, pfy)    { continue; }
+                let pf_flat_u16 = pfy as u16 * self.width as u16 + pfx as u16;
+                if regions.region_of(pf_flat_u16) != player_region { continue; }
                 if self.walls.get(ptx, pty)    { continue; }
                 if state.boxes.get(ptx, pty)   { continue; }
 
@@ -507,9 +580,11 @@ impl Solver {
         dynamic: &DeadlockSetRegistry,
     ) -> bool {
 
-        let mut seen: HashSet<State> = HashSet::new();
+        let mut seen: FxHashSet<State> = FxHashSet::default();
         let mut queue: VecDeque<(State, u32)> = VecDeque::new();
         let mut nodes = 0u32;
+        let cells = self.width as usize * self.height as usize;
+        let mut regions = RegionMap::new(cells);
 
         seen.insert(state.clone());
         queue.push_back((state.clone(), 0));
@@ -532,7 +607,8 @@ impl Solver {
                 return false;
             }
 
-            for push in self.generate_pushes(&s) {
+            regions.build(&self.walls, &self.goals, &s.boxes, self.width, self.height);
+            for push in self.generate_pushes(&s, &regions) {
                 let mut new_boxes = s.boxes.clone();
                 new_boxes.clear(push.from_x, push.from_y);
 
@@ -553,9 +629,9 @@ impl Solver {
                 // freeze checks; using it inside discovery would multiply
                 // the per-state cost without strengthening the proof.
 
-                let new_player = self.normalise_player(
-                    push.from_flat as u16, &new_boxes,
-                );
+                // Only the player's own region matters here — discovery does no
+                // corral analysis — so a single fill beats labelling the board.
+                let new_player = self.normalise_player(push.from_flat as u16, &new_boxes);
                 let next = State { boxes: new_boxes, player_norm: new_player };
 
                 if seen.insert(next.clone()) {
@@ -571,6 +647,122 @@ impl Solver {
 }
 
 // ── Flood fill ─────────────────────────────────────────────────────────────
+
+/// Sentinel for a cell that belongs to no region (wall or box).
+const NO_REGION: u16 = u16::MAX;
+
+/// Connected components of the free cells for one box configuration.
+///
+/// The search used to answer three separate questions with three separate
+/// flood fills per successor — where does the player end up, which cells can
+/// the player reach, and what unreachable pockets exist.  All three fall out
+/// of a single labelling pass, and the buffers are reused across states rather
+/// than reallocated per call.
+struct RegionMap {
+    /// Region index per cell, or NO_REGION for walls and boxes.
+    label:         Vec<u16>,
+    /// Every free cell, grouped by region.
+    members:       Vec<u16>,
+    /// `members[starts[r]..starts[r + 1]]` is region `r`; has region_count + 1 entries.
+    starts:        Vec<u32>,
+    /// Lowest flat index in each region — the normalised player position.
+    rep:           Vec<u16>,
+    /// Whether a region holds a goal with no box on it.
+    has_bare_goal: Vec<bool>,
+    /// Reused BFS queue.
+    queue:         Vec<u16>,
+}
+
+impl RegionMap {
+    fn new(cells: usize) -> Self {
+        RegionMap {
+            label:         vec![NO_REGION; cells],
+            members:       Vec::with_capacity(cells),
+            starts:        Vec::new(),
+            rep:           Vec::new(),
+            has_bare_goal: Vec::new(),
+            queue:         Vec::with_capacity(cells),
+        }
+    }
+
+    /// Label every free cell. Cells are seeded in row-major order, so a
+    /// region's first member is its lowest flat index.
+    fn build(
+        &mut self,
+        walls: &BitPlane, goals: &BitPlane, boxes: &BitPlane,
+        width: u8, height: u8,
+    ) {
+        let cells = width as usize * height as usize;
+        self.label.clear();
+        self.label.resize(cells, NO_REGION);
+        self.members.clear();
+        self.starts.clear();
+        self.rep.clear();
+        self.has_bare_goal.clear();
+
+        for flat in 0..cells {
+            let x = (flat % width as usize) as u8;
+            let y = (flat / width as usize) as u8;
+            if walls.get(x, y) || boxes.get(x, y) { continue; }
+            if self.label[flat] != NO_REGION { continue; }
+
+            let r = self.rep.len() as u16;
+            self.starts.push(self.members.len() as u32);
+            self.rep.push(flat as u16);
+            let mut bare_goal = false;
+
+            self.queue.clear();
+            self.queue.push(flat as u16);
+            self.label[flat] = r;
+
+            let mut head = 0usize;
+            while head < self.queue.len() {
+                let c = self.queue[head];
+                head += 1;
+                self.members.push(c);
+
+                let cx = (c as usize % width as usize) as u8;
+                let cy = (c as usize / width as usize) as u8;
+                // Boxes are not part of any region, so a goal here is bare.
+                if goals.get(cx, cy) { bare_goal = true; }
+
+                for &(dx, dy) in &DIRS {
+                    let nx = cx as i8 + dx;
+                    let ny = cy as i8 + dy;
+                    if !in_bounds(width, height, nx, ny) { continue; }
+                    let (nx, ny) = (nx as u8, ny as u8);
+                    if walls.get(nx, ny) || boxes.get(nx, ny) { continue; }
+                    let nflat = ny as usize * width as usize + nx as usize;
+                    if self.label[nflat] != NO_REGION { continue; }
+                    self.label[nflat] = r;
+                    self.queue.push(nflat as u16);
+                }
+            }
+            self.has_bare_goal.push(bare_goal);
+        }
+        self.starts.push(self.members.len() as u32);
+    }
+
+    fn region_count(&self) -> u16 { self.rep.len() as u16 }
+
+    fn region_of(&self, flat: u16) -> u16 { self.label[flat as usize] }
+
+    /// Normalised player position: the lowest flat index reachable from `flat`.
+    fn rep_of(&self, flat: u16) -> u16 {
+        match self.label[flat as usize] {
+            NO_REGION => flat,
+            r => self.rep[r as usize],
+        }
+    }
+
+    fn members_of(&self, r: u16) -> &[u16] {
+        let lo = self.starts[r as usize] as usize;
+        let hi = self.starts[r as usize + 1] as usize;
+        &self.members[lo..hi]
+    }
+
+    fn has_bare_goal(&self, r: u16) -> bool { self.has_bare_goal[r as usize] }
+}
 
 fn flood_fill(
     start_x: u8, start_y: u8,
@@ -669,16 +861,6 @@ fn compute_tunnels(
     let cells = width as usize * height as usize;
     let mut out = vec![[false; 4]; cells];
 
-    // Perpendicular direction pairs: for DIRS[i] = (dx,dy), the perpendicular
-    // cells along the other axis are at offsets (±perp_dx, ±perp_dy).
-    // DIRS = [(0,-1),(0,1),(-1,0),(1,0)]
-    // perps[i] = the two perpendicular unit vectors for DIRS[i]
-    let perps: [[(i8, i8); 2]; 4] = [
-        [(-1, 0), (1, 0)], // for (0,-1) up   → left and right
-        [(-1, 0), (1, 0)], // for (0, 1) down → left and right
-        [(0, -1), (0, 1)], // for (-1,0) left → up and down
-        [(0, -1), (0, 1)], // for (1, 0) right→ up and down
-    ];
 
     for y in 0..height {
         for x in 0..width {
@@ -695,7 +877,7 @@ fn compute_tunnels(
 
                 // Both perpendicular neighbours at the current cell must be walls
                 // (or out-of-bounds — treated as walls for this purpose).
-                let [(pdx0, pdy0), (pdx1, pdy1)] = perps[dir_idx];
+                let [(pdx0, pdy0), (pdx1, pdy1)] = PERPS[dir_idx];
                 let p0x = x as i8 + pdx0;
                 let p0y = y as i8 + pdy0;
                 let p1x = x as i8 + pdx1;
@@ -710,21 +892,28 @@ fn compute_tunnels(
                 // perpendicular walls on the square the box is pushed FROM, not
                 // only on the square it lands on.  Without that, a box entering
                 // a corridor is forced straight through it, which loses any
-                // solution that parks a box at the corridor mouth and later
-                // pushes it back out the way it came.
+                // solution that parks a box at the mouth and later pushes it
+                // back out the way it came.
+                //
+                // YASS also admits "gate squares" (bottlenecks a box seals when
+                // it sits on them) and counts dead squares as blockers.  Both
+                // were tried here: the dead-square relaxation is unsound as
+                // written — it lost a solution on medium level 55 — and gate
+                // squares, while sound, changed nothing measurable on the
+                // 100-puzzle sample (82 solved either way, 177s vs 172s).
                 let sx = x as i8 - dx;
                 let sy = y as i8 - dy;
                 let src_blocked = if in_bounds(width, height, sx, sy) {
-                    let q0_wall = !in_bounds(width, height, sx + pdx0, sy + pdy0)
+                    let q0 = !in_bounds(width, height, sx + pdx0, sy + pdy0)
                         || walls.get((sx + pdx0) as u8, (sy + pdy0) as u8);
-                    let q1_wall = !in_bounds(width, height, sx + pdx1, sy + pdy1)
+                    let q1 = !in_bounds(width, height, sx + pdx1, sy + pdy1)
                         || walls.get((sx + pdx1) as u8, (sy + pdy1) as u8);
-                    q0_wall && q1_wall
+                    q0 && q1
                 } else {
                     true
                 };
 
-                if p0_wall && p1_wall && src_blocked {
+                if src_blocked && p0_wall && p1_wall {
                     out[flat][dir_idx] = true;
                 }
             }
@@ -1196,67 +1385,58 @@ impl Solver {
     /// `player_flat` — flat index of the player's position immediately after the
     ///                 push (`push.from_flat as u16` — the old box cell).
     /// `boxes`        — box bitplane already reflecting the completed push.
+    /// Convenience wrapper that builds its own labelling. The search itself
+    /// uses `corral_prune_in` with the labelling it already computed.
     fn corral_prune(&self, player_flat: u16, boxes: &BitPlane) -> bool {
-        let px = (player_flat as usize % self.width as usize) as u8;
-        let py = (player_flat as usize / self.width as usize) as u8;
+        let mut regions = RegionMap::new(self.width as usize * self.height as usize);
+        regions.build(&self.walls, &self.goals, boxes, self.width, self.height);
+        self.corral_prune_in(player_flat, boxes, &regions)
+    }
 
-        // Player's reachable floor region in the new state.
-        let reachable = flood_fill(px, py, &self.walls, boxes, self.width, self.height);
+    /// A corral is a region the player cannot reach. If one contains no bare
+    /// goal and any box fencing it is already deadlocked, the position is lost.
+    ///
+    /// Regions are seeded in row-major order, so this visits pockets in the
+    /// same order the old seed-and-flood-fill version did.
+    fn corral_prune_in(
+        &self,
+        player_flat: u16,
+        boxes: &BitPlane,
+        regions: &RegionMap,
+    ) -> bool {
+        let player_region = regions.region_of(player_flat);
 
-        // Track interior cells already assigned to a corral pocket so we do
-        // not re-seed from them and process the same pocket twice.
-        let mut interior_seen = BitPlane::new(self.width, self.height);
+        for r in 0..regions.region_count() {
+            if r == player_region { continue; }
+            // A bare goal inside the pocket may still need a box pushed onto
+            // it, so this is not safe to call a deadlock without deeper
+            // analysis.
+            if regions.has_bare_goal(r) { continue; }
 
-        for y in 0..self.height {
-            for x in 0..self.width {
-                // Candidate seed: floor cell, not a box, not player-reachable,
-                // not already part of a processed corral.
-                if self.walls.get(x, y) { continue; }
-                if boxes.get(x, y)      { continue; }
-                if reachable.get(x, y)  { continue; }
-                if interior_seen.get(x, y) { continue; }
-
-                // Flood-fill from this seed (obstacles = walls + boxes) to find
-                // the full corral pocket.
-                let interior = flood_fill(x, y, &self.walls, boxes, self.width, self.height);
-
-                // Mark all pocket cells so future seeds skip them.
-                for (ix, iy) in interior.iter_set_bits() {
-                    interior_seen.set(ix, iy);
-                }
-
-                // Safety guard: bare goal inside the pocket → skip.
-                // We may still need to push a box there, so we cannot safely
-                // declare a deadlock without deeper analysis.
-                let has_bare_goal = interior
-                    .iter_set_bits()
-                    .any(|(ix, iy)| self.goals.get(ix, iy) && !boxes.get(ix, iy));
-                if has_bare_goal { continue; }
-
-                // Collect fence boxes: boxes adjacent to at least one pocket cell.
-                let mut fence: Vec<(u8, u8)> = Vec::new();
-                for (ix, iy) in interior.iter_set_bits() {
-                    for &(dx, dy) in &DIRS {
-                        let nx = ix as i8 + dx;
-                        let ny = iy as i8 + dy;
-                        if !in_bounds(self.width, self.height, nx, ny) { continue; }
-                        let (nx, ny) = (nx as u8, ny as u8);
-                        if boxes.get(nx, ny) && !fence.contains(&(nx, ny)) {
-                            fence.push((nx, ny));
-                        }
+            // Fence boxes: boxes adjacent to at least one pocket cell.
+            let mut fence: Vec<(u8, u8)> = Vec::new();
+            for &c in regions.members_of(r) {
+                let cx = (c as usize % self.width as usize) as u8;
+                let cy = (c as usize / self.width as usize) as u8;
+                for &(dx, dy) in &DIRS {
+                    let nx = cx as i8 + dx;
+                    let ny = cy as i8 + dy;
+                    if !in_bounds(self.width, self.height, nx, ny) { continue; }
+                    let (nx, ny) = (nx as u8, ny as u8);
+                    if boxes.get(nx, ny) && !fence.contains(&(nx, ny)) {
+                        fence.push((nx, ny));
                     }
                 }
+            }
 
-                // If any fence box is already deadlocked, this state is unsolvable.
-                for &(fx, fy) in &fence {
-                    if self.has_set_deadlock(fx, fy, boxes) {
-                        return true;
-                    }
-                    if is_freeze_deadlock(
-                        fx, fy, boxes, &self.walls, &self.goals, &self.dead,
-                    ) {
-                        return true;
-                    }
+            for &(fx, fy) in &fence {
+                if self.has_set_deadlock(fx, fy, boxes) {
+                    return true;
+                }
+                if is_freeze_deadlock(
+                    fx, fy, boxes, &self.walls, &self.goals, &self.dead,
+                ) {
+                    return true;
                 }
             }
         }
